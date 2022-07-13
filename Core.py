@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xml.etree.cElementTree as et
 from lmfit import Model
+from scipy.fftpack import dst
 
 import pandas as pd
 import multiprocessing as mp
@@ -20,9 +21,9 @@ class Track:
     def __init__(self):
         self.nSpots = None
         self.quality = None
-        self.t, self.x, self.y, self.z = None, None, None, None
+        self.Filter = None
+        self.t, self.x, self.y, self.z = None, None, None, None # In num frame and pixel
         self.diff_x, self.diff_y = None, None
-
         self.drift_x, self.drift_y = None, None
         self.Dx_gauss, self.Dy_gauss = None, None
         self.Dx_msd, self.Dy_msd = None, None
@@ -165,14 +166,17 @@ class AnalyzeTrackCore():
 
     """
     def __init__(self):
+        self.Filter = 10
         self.tracks = None
         self.nTracks = None
         self.frameInterval = None
-        self.spaceUnits = 263   # in nm
-        self.timeUnits = 1/30   # in s
+        self.space_units_nm = 263 # in nm
+        self.timeUnits = 1/60   # in s
         self.T = 293    #in K
         self.eta = 0.001    # in Pa.s
         self.sigma_already_known = False
+        self.R = 1/6
+        self.division = 10
 
         self.algo_drift = "self"
 
@@ -184,8 +188,30 @@ class AnalyzeTrackCore():
 
         return None
 
+    def change_filter(self, Valeur):
+        self.Filter = int(Valeur.get())
 
-    def covariance(self, Delta_t=1/60, R=1/6, sigma_square=None, algo_drift="self"):
+    def get_sublists(self,original_list, sublists_number):
+        list_size = len(original_list)
+        sublist_size_except_last = list_size // sublists_number
+        last_sublist_size = list_size % sublists_number
+        sublists = list()
+        l_index = 0
+        r_index = list_size - 1
+
+        for i in range(sublists_number):
+            l_index = (i * sublist_size_except_last)
+            r_index = ((i + 1) * sublist_size_except_last) - 1
+            if i != sublists_number - 1:
+                sublists.append(original_list[l_index:r_index + 1])
+            else:
+                r_index = r_index + last_sublist_size
+                sublists.append(original_list[l_index:r_index + 1])
+
+        return sublists
+
+
+    def covariance(self , sigma_square=None, algo_drift="self"):
         """
         Calcul du coefficeint de diffusion D à partir de la covariance :
 
@@ -198,58 +224,244 @@ class AnalyzeTrackCore():
         :param sigma_square: Erreur de localisation qui peut être mesurée ou estimée à partir des
         :return:
         """
-        self.Moyennex = float(0)
-        self.i = 0
+        self.taille =[]
+        self.Spectre = []
+        self.Spectre_mean = []
+        self.Spectre_moyenne = []
+        self.Moyennex = 0
+        self.Moyenney = 0
+        self.Moyenner = []
+        self.Controle = []
+        self.Controle_variance =[]
+        self.Controle_track = np.array([])
+        self.lim_min = 0*10**-9
+        self.lim_max = 200*10**-9
+        self.nombre =int((self.lim_max*10**9 - self.lim_min*10**9)+1)
+        Moyenner=[]
+        Gauss1 = []
+        Gauss =[]
+        self.MSDx_lag =[]
+        self.covariancex_lag=[]
+        self.trivariancex_lag =[]
+        self.quadravariancex_lag=[]
+        self.pentavariancex_lag=[]
+        self.sixtvariancex_lag=[]
+        self.septavariancex_lag=[]
+        self.octavariancex_lag=[]
+        self.MSDx_lag_variance = []
+        self.covariancex_lag_variance = []
+        self.trivariancex_lag_variance = []
+        self.quadravariancex_lag_variance = []
+        self.pentavariancex_lag_variance = []
+        self.sixtvariancex_lag_variance = []
+        self.septavariancex_lag_variance = []
+        self.octavariancex_lag_variance = []
+        self.MSDy_lag = []
+        self.covariancey_lag = []
+        self.trivariancey_lag = []
+        self.quadravariancey_lag = []
+        self.pentavariancey_lag = []
+        self.sixtvariancey_lag = []
+        self.septavariancey_lag = []
+        self.octavariancey_lag = []
+
+        i=0
+        # FIXME  absicsse basée sur les données
+        self.x_full_gauss = [i for i in np.linspace(self.lim_min*10**9, self.lim_max*10**9, self.nombre)]
+
         # TODO sigma (bruit localisation) à partir des données de la track ou alors sigma
         # moyen sur l'ensemble des tracks ou alors sigma utilisateur
 
         # TODO work in progress
         for track in self.tracks:
-            if track.nSpots < 10 :
+            if track.nSpots < self.Filter :
                 track.isFiltered = True
             if track.isFiltered is True :
                 track.r_cov = np.nan
             else:
-                self.i=self.i+1
+                i = i+1
 
-                diff_x_1 = self.calculate_displacement(track.x*265*10**-9, algo="None")
-                diff_x_2 = self.calculate_displacement(track.x*265*10**-9, algo="covar")
-                drift = np.nanmean(diff_x_1)
-                MSD = np.mean((diff_x_1-drift) ** 2)
-                covariance = np.mean((diff_x_1[:-1]-drift) * (diff_x_2-2*drift))
+                diff_x_1 = self.calculate_displacement(track.x*self.space_units_nm*10**-9, algo="None")
 
-                if sigma_square is None:
-                    track.Dx = MSD / (2*Delta_t) + covariance/Delta_t
-                    sigma_square = R*MSD + (2*R-1)*covariance
-                    r_cov_1 = (1.38*10**(-23)*293)/(6*np.pi*0.001*track.Dx)
-                    track.r_cov = round(r_cov_1,12)
+                driftx = np.nanmean(diff_x_1)
+                #driftx = 0
+
+                MSDx = np.mean((diff_x_1-driftx) ** 2)
+                covariancex = np.mean((diff_x_1[:-1]-driftx) * (diff_x_1[1:]-driftx))
+
+
+                self.MSDx_lag.append(np.mean((diff_x_1) * (diff_x_1)))
+                self.covariancex_lag.append(np.mean((diff_x_1[:-1] ) * (diff_x_1[1:] )))
+                self.trivariancex_lag.append(np.mean((diff_x_1[:-2] ) * (diff_x_1[2:] )))
+                self.quadravariancex_lag.append(np.mean((diff_x_1[:-3] ) * (diff_x_1[3:] )))
+                self.pentavariancex_lag.append(np.mean((diff_x_1[:-4] ) * (diff_x_1[4:] )))
+                self.sixtvariancex_lag.append(np.mean((diff_x_1[:-5] ) * (diff_x_1[5:] )))
+                self.septavariancex_lag.append(np.mean((diff_x_1[:-6] ) * (diff_x_1[6:] )))
+                self.octavariancex_lag.append(np.mean((diff_x_1[:-7] ) * (diff_x_1[7:] )))
+
+
+
+
+
+                sigma_squarex = self.R * MSDx + (2 * self.R - 1) * covariancex
+                track.D_x = (MSDx - 2*sigma_squarex) / ((2-4*self.R)*self.timeUnits)
+                track.x_cov =(1.38*10**(-23)*self.T)/(6*np.pi*self.eta*track.D_x)
+                alpha = 2*track.D_x*self.timeUnits
+                beta = sigma_squarex - 2*track.D_x*self.timeUnits*self.R
+                self.Spectre.append((2 * (0.5*self.timeUnits*dst(diff_x_1,type = 1)) ** 2) / ((track.nSpots + 1) * self.timeUnits * track.D_x * (self.timeUnits) ** 2))
+
+                x1 = self.get_sublists(self.Spectre[i-1], self.division)
+                self.taille.append(np.size(x1[0]))
+                for j in range(self.division) :
+                    self.Spectre_moyenne = np.append(self.Spectre_moyenne,np.mean(x1[j]))
+
+                self.Spectre_mean.append(self.Spectre_moyenne)
+                self.Spectre_moyenne = []
+
+                self.MSDx_lag_variance.append(0)
+                self.covariancex_lag_variance.append(0)
+                self.trivariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 2)) - ((2 * beta ** 2) / ((track.nSpots - 2) ** 2)))
+                self.quadravariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 3)) - ((2 * beta ** 2) / ((track.nSpots - 3) ** 2)))
+                self.pentavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 4)) - ((2 * beta ** 2) / ((track.nSpots - 4) ** 2)))
+                self.sixtvariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 5)) - ((2 * beta ** 2) / ((track.nSpots - 5) ** 2)))
+                self.septavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 6)) - ((2 * beta ** 2) / ((track.nSpots - 6) ** 2)))
+                self.octavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 7)) - ((2 * beta ** 2) / ((track.nSpots - 7) ** 2)))
+
+                if np.abs(track.x_cov) > 200*10**-9:
+                    track.x_cov = 0
+                if track.x_cov == np.nan:
+                    self.Moyennex = self.Moyennex
                 else:
-                    sigma_square = R * MSD + (2 * R - 1) * covariance
-                    track.D_x = MSD - 2*sigma_square / (2*(1-2*R)*Delta_t)
-                    r_cov_1 =(1.38*10**(-23)*293)/(6*np.pi*0.001*track.D_x)
-                    track.r_cov = round(r_cov_1, 12)
-            if track.r_cov == np.nan:
-                self.Moyennex = self.Moyennex
-            else:
-                self.Moyennex = self.Moyennex + r_cov_1 / self.i
+                    self.Moyennex = self.Moyennex + track.x_cov
+
+                diff_y_1 = self.calculate_displacement(track.y * self.space_units_nm*10**-9, algo="None")
+
+                drifty = np.nanmean(diff_y_1)
+                MSDy = np.mean((diff_y_1 - drifty) ** 2)
+                covariancey = np.mean((diff_y_1[:-1] - drifty) * (diff_y_1[1:] - drifty))
+
+                self.MSDy_lag.append(np.mean((diff_y_1) * (diff_y_1)))
+                self.covariancey_lag.append(np.mean((diff_y_1[:-1]) * (diff_y_1[1:])))
+                self.trivariancey_lag.append(np.mean((diff_y_1[:-2]) * (diff_y_1[2:])))
+                self.quadravariancey_lag.append(np.mean((diff_y_1[:-3]) * (diff_y_1[3:])))
+                self.pentavariancey_lag.append(np.mean((diff_y_1[:-4]) * (diff_y_1[4:])))
+                self.sixtvariancey_lag.append(np.mean((diff_y_1[:-5]) * (diff_y_1[5:])))
+                self.septavariancey_lag.append(np.mean((diff_y_1[:-6]) * (diff_y_1[6:])))
+                self.octavariancey_lag.append(np.mean((diff_y_1[:-7]) * (diff_y_1[7:])))
+
+
+                sigma_squarey = self.R * MSDy + (2 * self.R - 1) * covariancey
+                track.D_y = (MSDy - 2 * sigma_squarey) / ((2 - 4 * self.R) * self.timeUnits)
+                track.y_cov = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * track.D_y)
+
+                if np.abs(track.y_cov) > 200*10**-9:
+                    track.y_cov = 0
+                if track.y_cov == np.nan:
+                    self.Moyenney = self.Moyenney
+                else:
+                    self.Moyenney = self.Moyenney + track.y_cov
+
+
+                track.r_cov = track.x_cov
+
+                self.Moyenner.append(track.x_cov*10**9)
+                #self.Moyenner.append(track.y_cov*10**9)
+
+                zetha = sigma_squarex/(track.D_x*self.timeUnits) - 2*self.R
+
+                Variancex_D = track.D_x**2 * ((6 + 4 * zetha + 2 * zetha**2) / (track.nSpots) + (4 * (1 + zetha)**2) / (track.nSpots**2))
+                track.x_cov_1 = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * (track.D_x+np.sqrt(Variancex_D)))
+                track.x_cov_2 = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * (track.D_x-np.sqrt(Variancex_D)))
+
+                Variance = ((track.x_cov_2 - track.x_cov_1)/2)**2
+                #Variance = (track.x_cov / track.D_x ) * Variance_D
+                #Variance = np.sqrt(np.sqrt(MSDx ** 2 + MSDy ** 2) / (track.nSpots - 1))
+                if track.x_cov != 0:
+                    Gauss1.append((1/(np.sqrt(Variance*10**18)*np.sqrt(2*np.pi)))*np.exp(-(self.x_full_gauss-track.x_cov*10**9)**2/(2*Variance*10**18)))
+
+                track.error_r_cov = np.absolute((track.x_cov_2 - track.x_cov_1)/2)
+                track.error_r_cov =  "{:e}".format(track.error_r_cov)
+                track.r_cov =  "{:e}".format(track.r_cov)
+
+
         #TODO check and y axis
-        print(self.Moyennex)
+        Moyenne = np.nanmean(Moyenner)
+        self.Gauss_full_track = np.nansum(Gauss1,axis = 0)
+        self.Gauss_full_track /= np.max(self.Gauss_full_track)
+        Max_value=np.max(self.Gauss_full_track)
+        self.Max_index = np.where(self.Gauss_full_track == Max_value)
+        self.Max_index = self.Max_index[0]*10**-9+self.lim_min
+
+        self.Controle_track = self.MSDx_lag
+        self.Controle_track= np.vstack((self.Controle_track,self.covariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.trivariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.quadravariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.pentavariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.sixtvariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.septavariancex_lag))
+        self.Controle_track= np.vstack((self.Controle_track,self.octavariancex_lag))
+
+        self.Controle_track_variance = self.MSDx_lag_variance
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.covariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.trivariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.quadravariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.pentavariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.sixtvariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.septavariancex_lag_variance))
+        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.octavariancex_lag_variance))
+
+
+
+        self.Controle.append(np.mean(self.MSDx_lag))
+        self.Controle.append(np.mean(self.covariancex_lag))
+        self.Controle.append(np.mean(self.trivariancex_lag))
+        self.Controle.append(np.mean(self.quadravariancex_lag))
+        self.Controle.append(np.mean(self.pentavariancex_lag))
+        self.Controle.append(np.mean(self.sixtvariancex_lag))
+        self.Controle.append(np.mean(self.septavariancex_lag))
+        self.Controle.append(np.mean(self.octavariancex_lag))
+
+        self.Controle_variance.append(np.mean(self.MSDx_lag_variance))
+        self.Controle_variance.append(np.mean(self.covariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.trivariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.quadravariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.pentavariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.sixtvariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.septavariancex_lag_variance))
+        self.Controle_variance.append(np.mean(self.octavariancex_lag_variance))
+
+
+
+
+        # plt.plot(x,np.transpose(Gauss1))
+        # plt.show()
+
+
+        #self.fig_result_all_track = plt.Figure()
+        #ax1 = self.fig_result_all_track.add_subplot(221)
+        #ax1.plot(x, Gauss)
+        #ax1.set_title('Représentation des valeurs de rayon')
+
+
         #TODO variance on D
+
 
 
     def load_txt(self, filepath):
 
         # TODO verifier que la position de l'export est toujours la même. Sinon, coder un truc
         # On skip la premiere colone qui n'est pas un nombre.
-        raw = np.loadtxt(filepath, skiprows=1, usecols=np.arange(1, 21))
+        raw = np.loadtxt(filepath, skiprows=1, usecols=np.arange(1, 19))
 
         #Label ID TRACK_ID QUALITY POSITION_X POSITION_Y POSITION_Z POSITION_T FRAME RADIUS VISIBILITY MANUAL_COLOR MEAN_INTENSITY MEDIAN_INTENSITY MIN_INTENSITY MAX_INTENSITY TOTAL_INTENSITY STANDARD_DEVIATION ESTIMATED_DIAMETER CONTRAST SNR
         nb_lines = np.shape(raw)[0]
-        self.nTracks = int(raw[-1, 1])  #Track_ID
+        #self.nTracks = int(raw[-1, 1])  #Track_ID
 
-        self.tracks = [Track() for k in range(self.nTracks)]
+        #self.tracks = [Track() for k in range(self.nTracks)]
 
         unique, unique_index = np.unique(raw[:,1], return_index=True)
+        self.nTracks = np.size(unique)-1
+        self.tracks = [Track() for k in range(self.nTracks)]
         i = 0
         for i in range(self.nTracks):
             data = raw[unique_index[i]:unique_index[i+1], :]
@@ -278,6 +490,7 @@ class AnalyzeTrackCore():
     def analyze_all_tracks(self):
         self.calculate_r_from_gauss()
         self.covariance()
+
 
     def calculate_displacement(self, pos, algo="None", step=1):
         """
@@ -320,13 +533,17 @@ class AnalyzeTrackCore():
             return amp * np.exp(-(x - cen) ** 2 / wid)
 
         diff = self.calculate_displacement(pos, algo_drift_compensation)
-        hist, boundaries = np.histogram(diff)
+
+        # https://indico.cern.ch/event/428334/contributions/1047042/attachments/919069/1299634/ChoosingTheRightBinWidth.pdf
+
+        hist, boundaries = np.histogram(diff, bins="sturges")
         boundaries = boundaries[0:-1]
         gmodel = Model(gaussian, nan_policy='raise')
         max_, min_ = np.max(hist), np.min(hist)
         max_bound, min_bound = np.max(boundaries), np.min(boundaries)
         params = gmodel.make_params(cen=np.mean(diff), amp=max_, wid=np.std(diff))
-        params["amp"].min = 2 * max_
+        params["amp"].min = 0
+        params["amp"].max = 2 * max_
         params["wid"].min = 0
         params["cen"].min = min_bound
 
@@ -493,11 +710,11 @@ class AnalyzeTrackCore():
         kb_ = 1.38E-23
         i = 0
         for track in self.tracks:
-            if i==963:
-                track.r_gauss = -1
-                dummy = 1
-                i += 1
-                continue
+            # if i==963:
+            #     track.r_gauss = -1
+            #     dummy = 1
+            #     i += 1
+            #     continue
             print(i)
             i += 1
             if track.isFiltered:
@@ -512,31 +729,33 @@ class AnalyzeTrackCore():
             # FIXME
             if diff_x is None:
                 continue
-            #FIXME passer de pixel à nm
-            msd = width_x.value*2 + center_x.value**2
-            msd *= self.spaceUnits * 1E-9   # 1E-9 nm -> m
+            mean_squared_SI = (center_x.value*self.space_units_nm*1E-9)**2
+            variance_SI = (width_x.value*self.space_units_nm*self.space_units_nm*1E-18) /2
+            # msd = width_x.value*2 + center_x.value**2
+            # TODO cehck the importance of the mean
+            # msd = variance_SI + mean_squared_SI
+            msd = variance_SI
             track.Dx_gauss = msd/(2*self.timeUnits)
             track.rx_gauss = kb_ * self.T / (6 * np.pi * self.eta * track.Dx_gauss)
+
 
             diff_y, hist_y, boundaries_y, result_y, center_y, width_y = self.gaussian_delta_fit(track.y, self.algo_drift)
             if diff_y is None:
                 continue
-            msd = width_y.value/2 + center_y**2
-            msd *= self.spaceUnits * 1E-9
+            variance_SI = (width_y.value * self.space_units_nm * self.space_units_nm * 1E-18) / 2
+
+            mean_squared_SI = (center_y.value * self.space_units_nm * 1E-9) ** 2
+            # msd = variance_SI + mean_squared_SI
+            msd = variance_SI
             track.Dy_gauss = msd/(2*self.timeUnits)
             track.ry_gauss = kb_ * self.T / (6 * np.pi * self.eta * track.Dy_gauss)
 
             #FIXME mean or np.sqrt(track.rx_gauss**2 + track.ry_gauss**2)/2
             track.r_gauss = (track.rx_gauss + track.ry_gauss)/2
+            track.r_gauss = "{:e}".format(track.r_gauss)
 
 
-    def generate_free_brownian_motion(self, params):
-        #FIXME get info from params
-        self.nb_part = 100
-        for n in self.nb_part:
-            # r = np.
-            pass
-        pass
+
 
     def loadxmlTrajs(self, trackmate_xml_path):
         """
@@ -555,7 +774,7 @@ class AnalyzeTrackCore():
         # print(root.attrib)  # or extract metadata
         self.nTracks = int(root.attrib['nTracks'])
         self.frameInterval = float(root.attrib['frameInterval'])
-        self.spaceUnits = root.attrib['spaceUnits']
+        self.space_units_nm = root.attrib['spaceUnits']
         self.timeUnits = root.attrib['timeUnits']
 
         # Working with numpy array -> TOO SLOW
@@ -640,6 +859,160 @@ class AnalyzeTrackCore():
         # Calculate Dx, Dy, rx, ry, etc
 
 
+    def generate_brownian_track(self, params_dict):
+        #FIXME from params_dict
+        T = 293
+        eta = 1E-3
+        delta_t_ms = 30
+        nb_of_frame = 20000
+        particle_mean_diam_nm = 50
+        particle_diam_sigma_relative = 0
+        dim_box_X_micron = 3000
+        dim_box_Y_micron = 3000
+        dim_box_Z_micron = 50
+        nb_particle = 100
+        depth_of_focus_micron = 100
+        drift_X_microns_per_frame = 0
+        drift_Y_microns_per_frame = 0
+
+        self.space_units_nm = 263   # in nm
+        self.timeUnits = delta_t_ms/1000   # in s
+        self.T = T
+        self.eta = eta
+
+
+        kb = 1.380649E-23
+
+        particle_radiuss = np.random.normal(loc=particle_mean_diam_nm/2, scale=particle_mean_diam_nm/2*particle_diam_sigma_relative, size=nb_particle)
+        mean_diff_coeff = kb * T / (6*np.pi*eta*(particle_mean_diam_nm/2*1E-9))
+        diff_coeffs = kb * T / (6*np.pi*eta*(particle_radiuss*1E-9))
+
+        # brownian_length = np.sqrt(2*mean_diff_coeff*delta_t_ms*1E-3)
+        # mean_nb_spot_pert_track  = 0
+        # mean_dwell_time_in_focus_s = (depth_of_focus_micron*1E-9)**2/(2*mean_diff_coeff)
+
+        npParticleType = np.dtype(
+            [('x', np.float), ('y', np.float), ('z', np.float), ('Dtx', np.float), ('Dty', np.float),
+             ('Dtz', np.float)])
+        particles = np.zeros(nb_particle, dtype=npParticleType)
+
+
+        particles[:]['Dtx'] = particles[:]['Dtz'] = particles[:]['Dty'] = diff_coeffs
+
+        # Initial position -> offset to all position
+        r = np.random.rand(nb_particle, 3)
+        particles[:]['x'] = r[:, 0] * dim_box_X_micron
+        particles[:]['y'] = r[:, 1] * dim_box_Y_micron
+        particles[:]['z'] = r[:, 2] * 2*dim_box_Z_micron - dim_box_Z_micron # centered on z = 0 i.e. the focal plane
+
+        #Brownian motion
+
+
+        # Draw random samples from a normal (Gaussian) distribution.
+        dr = np.random.normal(loc=0, scale=1.0, size=(nb_of_frame, nb_particle, 3))
+
+        # Constant drift
+        dr[:, :, 0] += drift_X_microns_per_frame
+        dr[:, :, 1] += drift_Y_microns_per_frame
+
+        # Construct the brownian trajectory by adding all the displacement
+        dr = np.cumsum(dr, axis=0, out=dr)
+
+        # TODO do not create a new array at each iteration
+        mvt_evolution = np.zeros((nb_of_frame, nb_particle), dtype=npParticleType)
+
+        # offsetting at t=0 by the initial position
+        mvt_evolution[:] = particles
+
+        # Scaling the displacement with the diffusion coefficient
+        mvt_evolution[:]['x'] += dr[:, :, 0] * np.sqrt(2 * particles[:]['Dtx'] * self.timeUnits) * 1E6
+        mvt_evolution[:]['y'] += dr[:, :, 1] * np.sqrt(2 * particles[:]['Dty'] * self.timeUnits) * 1E6
+        mvt_evolution[:]['z'] += dr[:, :, 2] * np.sqrt(2 * particles[:]['Dtz'] * self.timeUnits) * 1E6
+
+        # Extract track from brownian trajectory
+        self.tracks = []
+
+        # Une track est un ensemble de spot dont la position est comprise entre :
+        # x ∈ [0, dimX] and y ∈ [0, dimY] and z ∈ [-dof, +dof] where dof : depth of focus
+        # Les deux premieres conditions sont toujours vérifiées si on applique des conditions aux limites périodiques
+
+        def consecutive(data, stepsize=1):
+            # return np.split(data, np.where(np.diff(data) != stepsize)[0] + 1)
+            idx = np.r_[0, np.where(np.diff(data) != stepsize)[0] + 1, len(data)]
+            return [data[i:j] for i, j in zip(idx, idx[1:])]
+
+
+
+        xs = mvt_evolution[:]['x']
+        ys = mvt_evolution[:]['y']
+        zs = mvt_evolution[:]['z']
+        dof = depth_of_focus_micron
+        for i in range(nb_particle):
+            z = zs[:, i]
+            idx_in_focus = np.where(np.logical_and(z < dof, z > -dof))
+            if len(idx_in_focus[0]) > 1:  # Test if the list is not empty
+                tracks_idx = consecutive(idx_in_focus)
+                # FIXME there is a problem with the "consecutive" function that return empty array
+                pos_micro_to_pixel = 1/(self.space_units_nm/1000)
+                for j in range(len(tracks_idx)):
+                    if len(tracks_idx[j]) > 0:
+                        # Create new track
+                        track = Track()
+                        track.x = xs[tracks_idx[j], i][0] * pos_micro_to_pixel
+                        track.y = ys[tracks_idx[j], i][0] * pos_micro_to_pixel
+                        track.z = zs[tracks_idx[j], i][0]
+                        track.t = tracks_idx[j][0]
+                        track.quality = 1
+                        track.nSpots = track.x.size
+
+                        self.tracks.append(track)
+        self.nTracks = len(self.tracks)
+        self.analyze_all_tracks()
+
+    def filter_tracks(self, low1, high1, type1, not1, bool_op, low2, high2, type2, not2):
+        #FIXME inclusive frontiere ?
+        def is_to_be_filtered(track, type, low, high):
+            filter_OK = False
+
+            val = None
+            if type == "nb spots":
+                val = track.nSpots
+            # FIXME
+            elif type == "r nm":
+                val = track.r_nm
+            elif type == "CPS":
+                val = track.CPS
+            if val is not None:
+                if val < low or val > high:
+                    filter_OK = True
+            return filter_OK
+
+        for track in self.tracks:
+            filter1_OK = is_to_be_filtered(track, type1, low1, high1)
+            filter2_OK = is_to_be_filtered(track, type2, low2, high2)
+
+            if not1 and type1 != "None":
+                filter1_OK = not filter1_OK
+            if not2 and type2 != "None":
+                filter2_OK = not filter2_OK
+
+            is_track_filtered = False
+            if bool_op == "and":
+                is_track_filtered = filter1_OK and filter2_OK
+            elif bool_op == "or":
+                is_track_filtered = filter1_OK or filter2_OK
+            elif bool_op == "xor":
+                is_track_filtered = (filter1_OK and not(filter2_OK)) or (not(filter1_OK) and filter2_OK)
+
+            if is_track_filtered:
+                track.is_filtered = True
+            else:
+                track.is_filtered = False
+
+
+
+
+
     def get_data_from_num_track(self, num):
         return self.tracks[num]
 
@@ -656,4 +1029,9 @@ class AnalyzeTrackCore():
     #         spots = spots[spots[name] < value]
     #
     #     return spots
+
+if __name__ == "__main__":
+    core = AnalyzeTrackCore()
+    core.generate_brownian_track(params_dict=None)
+    pass
 
