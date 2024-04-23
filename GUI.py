@@ -412,7 +412,7 @@ class OpenFilesWindow(tk.Toplevel):
         self.video_name_var.set("None")
         self.current_task_var = tk.StringVar()
         self.current_task_var.set("Aucune tâche en cours.")
-        self.grab_set()  # The grab_set method renders the window modal, meaning that the user will not be able to interact with other application windows while this window is open.top left corner
+        #self.grab_set()  # The grab_set method renders the window modal, meaning that the user will not be able to interact with other application windows while this window is open.top left corner
 
         self.setup_gui()
 
@@ -675,8 +675,7 @@ class pyAnalyzeTrack():
         ttk.Label(self.frame_filter, text=' < ').grid(row=2, column=2, padx=pad_filter)
 
         self.cb_value_filter_2_sv = tk.StringVar()
-        self.cb_value_filter_2 = ttk.Combobox(self.frame_filter, width=25, justify=tk.CENTER,
-                                              textvariable=self.cb_value_filter_2_sv, values='')
+        self.cb_value_filter_2 = ttk.Combobox(self.frame_filter, width=25, justify=tk.CENTER,textvariable=self.cb_value_filter_2_sv, values='')
         self.cb_value_filter_2['values'] = self.cb_value_filter_1['values'] = self.list_plotable_and_filter_data
         self.cb_value_filter_2.set('None')
         self.cb_value_filter_2.bind('<<ComboboxSelected>>', self.change_filter2_type)
@@ -766,14 +765,19 @@ class pyAnalyzeTrack():
         cb = ttk.Combobox(self.frame_graph_all_tracks_params, width=13, justify=tk.CENTER,textvariable=self.plot_all_mode_sv,values='')
 
         # cb.bind('<<ComboboxSelected>>', self.change_algo)
-        cb['values'] = ('Sum gaussian', 'Lags', 'Radius Histogram')
+        cb['values'] = ('Sum gaussian', 'Lags', 'Radius Histogram', 'Radius Red Histogram', 'Radius Green Histogram')
         self.plot_all_mode_sv.set('Sum gaussian')
         cb.grid(row=0, column=0, padx=8)
 
         tk.Label(self.frame_graph_all_tracks_params, text='Rayon (Covariance) =').grid(row=3, column=0)
         self.max_index_sv = tk.StringVar()  # Valeur en x max de la gaussienne
-
         self.maximum = tk.Label(self.frame_graph_all_tracks_params, textvariable=self.max_index_sv).grid(row=3, column=1)
+
+        tk.Label(self.frame_graph_all_tracks_params, text="Nombre de spots moyen =").grid(row=4, column=0)
+        self.moyenne_spots = tk.StringVar()  # Valeur en x max de la gaussienne
+        self.M_spots = tk.Label(self.frame_graph_all_tracks_params, textvariable=self.moyenne_spots).grid(row=4,column=1)
+
+
 
     def create_current_track_analyze(self):
         self.fig_result_current_track = plt.Figure(figsize=(4, 4), dpi=100)
@@ -839,20 +843,118 @@ class pyAnalyzeTrack():
         # FILE#############
         self.menu_file = tk.Menu(self.menu_system, tearoff=0)
         self.menu_file.add_command(label='open', underline=1, accelerator="Ctrl+o", command=self.open_xml_trackmate)
-        self.menu_file.add_command(label='generate', underline=1, accelerator="Ctrl+g", command=self.generate_data)
+        self.menu_file.add_command(label='generate', underline=1, accelerator="Ctrl+g", command=self.create_menu_generate)#self.generate_data)
         self.menu_file.add_command(label='Save State', underline=1, accelerator="Ctrl+s", command=self.save_state)
         # self.master.bind_all("<Control-s>", self.saveState)
         self.menu_file.add_command(label='Load State', underline=1, accelerator="Ctrl+l", command=self.load_state)
+        self.menu_file.add_command(label='Save Gaussian Data', underline=1, accelerator="Ctrl+t", command=self.save_data_gauss)
+        self.menu_file.add_command(label='Save Histogram Data', underline=1, accelerator="Ctrl+t",command=self.save_data_hist)
+        self.menu_file.add_command(label='Save Red Histogram Data', underline=1, accelerator="Ctrl+t",command=self.save_red_data_hist)
+        self.menu_file.add_command(label='Save Green Histogram Data', underline=1, accelerator="Ctrl+t",command=self.save_green_data_hist)
         self.menu_system.add_cascade(label="File", menu=self.menu_file)
 
         self.root.config(menu=self.menu_system)
 
         # self.master.bind_all("<Control-o>", self.askOpenSPC_file)
+    def save_data_gauss(self):
+        filePath = filedialog.asksaveasfile(title="Save State", defaultextension=".txt",filetypes=[("Text files", "*.txt")])
+        if filePath == None or filePath.name == '':
+            return None
+        self.core.save_data_gauss(filePath)
 
-    def generate_data(self):
+    def save_data_hist(self):
+        filePath = filedialog.asksaveasfile(title="Save State", defaultextension=".txt",filetypes=[("Text files", "*.txt")])
+        if filePath == None or filePath.name == '':
+            return None
+        self.core.save_data_hist(filePath)
+
+    def save_red_data_hist(self):
+        filePath = filedialog.asksaveasfile(title="Save State", defaultextension=".txt",filetypes=[("Text files", "*.txt")])
+        if filePath == None or filePath.name == '':
+            return None
+        self.core.save_red_data_hist(filePath)
+
+    def save_green_data_hist(self):
+        filePath = filedialog.asksaveasfile(title="Save State", defaultextension=".txt",filetypes=[("Text files", "*.txt")])
+        if filePath == None or filePath.name == '':
+            return None
+        self.core.save_green_data_hist(filePath)
+
+
+    def create_menu_generate(self):
+
+        entry_window = tk.Toplevel(self.root)
+        entry_window.title("Parameters of the particles")
+
+        # Create entry widgets in the new window
+
+
+        entry_label_1 = tk.Label(entry_window, text="Diameter of first particles (nm) :")
+        entry_label_1.pack(pady=5)
+
+        particle_mean_diam_nm = tk.StringVar(value = "60")
+        entry_widget_1 = tk.Entry(entry_window, textvariable=particle_mean_diam_nm)
+        entry_widget_1.pack(pady=5)
+
+        entry_label_2 = tk.Label(entry_window, text="Diameter of second particles (nm) :")
+        entry_label_2.pack(pady=5)
+
+        particle_mean_diam_nm_2 = tk.StringVar(value= "120")
+        entry_widget_2 = tk.Entry(entry_window, textvariable=particle_mean_diam_nm_2)
+        entry_widget_2.pack(pady=5)
+
+        entry_label_3 = tk.Label(entry_window, text="Relative sigma of the distribution of the particles size : ")
+        entry_label_3.pack(pady=5)
+
+        particle_diam_sigma_relative = tk.StringVar(value = "0.0")
+        entry_widget_3 = tk.Entry(entry_window, textvariable=particle_diam_sigma_relative)
+        entry_widget_3.pack(pady=5)
+
+        entry_label_4 = tk.Label(entry_window, text="Number of particles :")
+        entry_label_4.pack(pady=5)
+
+        nb_particle = tk.StringVar(value = "20000")
+        entry_widget_4 = tk.Entry(entry_window, textvariable=nb_particle)
+        entry_widget_4.pack(pady=5)
+
+        entry_label_5 = tk.Label(entry_window, text="Number of frame per track :")
+        entry_label_5.pack(pady=5)
+
+        nb_of_frame = tk.StringVar(value = "200")
+        entry_widget_5 = tk.Entry(entry_window, textvariable=nb_of_frame)
+        entry_widget_5.pack(pady=5)
+
+        entry_label_6 = tk.Label(entry_window, text="Ratio of monomères (%) :")
+        entry_label_6.pack(pady=5)
+
+        ratio_monomere = tk.StringVar(value="50")
+        entry_widget_6 = tk.Entry(entry_window, textvariable=ratio_monomere)
+        entry_widget_6.pack(pady=5)
+
+        action_button = tk.Button(entry_window, text="Generate",command=lambda : self.get_generate_data(particle_mean_diam_nm, particle_mean_diam_nm_2,particle_diam_sigma_relative, nb_particle,nb_of_frame,ratio_monomere))
+        action_button.pack(pady=10)
+
+
+
+    def get_generate_data(self,var1,var2,var3,var4,var5,var6):
+
+        params_dict = {
+            "Diam1": float(var1.get()),
+            "Diam2": float(var2.get()),
+            "sigma": float(var3.get()),
+            "nb_particle": int(var4.get()),
+            "nb_frame": int(var5.get()),
+            "ratio_monomere": int(var6.get())
+        }
+        self.generate_data(params_dict)
+
+
+
+
+    def generate_data(self,params_dict):
         # TODO creer une interface graphique pour collecter les parameters
 
-        self.core.generate_brownian_track(params_dict=None)
+        self.core.generate_brownian_track(params_dict)
         self.insert_tracks_tree_view()
         self.plot_result_all_track()
         pass
@@ -887,8 +989,8 @@ class pyAnalyzeTrack():
             # if track.is_highlighted:
             # 	tags_.append("highlighted")
 
-            iid_track = self.tree_view.insert(parent="",index='end',values=(str(num_track),str(track.nSpots),round_float(track.r_gauss * 1E9) + "+/-" + round_float(track.error_r_gauss * 1E9),round_float(track.r_msd * 1E9) + "+/-" + round_float(track.error_r_msd * 1E9),
-            round_float(track.r_cov_2 * 10 ** 9) + "+/-" + round_float(track.error_r_cov_2 * 10 ** 9),
+            iid_track = self.tree_view.insert(parent="",index='end',values=(str(num_track),str(track.nSpots),round_float(track.r_gauss * 1E9) + "+/-" + round_float(track.error_r_gauss * 1E9),round_float(track.r_cov * 1E9) + "+/-" + round_float(track.error_r_cov * 1E9),
+            round_float(track.r_msd * 10 ** 9) + "+/-" + round_float(track.error_r_msd * 10 ** 9),
             round_float(track.red_mean),
             round_float(track.green_mean),
             "",  # x
@@ -936,6 +1038,7 @@ class pyAnalyzeTrack():
 
     def plot_result_all_track(self):
         self.max_index_sv.set(str(self.core.Max_index)+"(m)")
+        self.moyenne_spots.set(str(int(self.core.moyenne_spots)))
 
 
         self.plot_all_track_mode = self.plot_all_mode_sv.get()
@@ -962,13 +1065,45 @@ class pyAnalyzeTrack():
             self.ax_result_all_tracks.clear()
             self.fig_result_all_tracks.set_tight_layout(True)
             # Histoy,Histox = np.histogram(self.core.Moyenner,bins=100)
-            Histoy, Histox = np.histogram(self.core.Moyenner, bins = 'auto')
-            self.ax_result_all_tracks.bar(Histox[:-1], Histoy)
+            filtered_data = np.array(self.core.Moyenner)[ np.array(self.core.Moyenner) <= self.core.lim_max * 10 ** 9 ]
+            Histoy, Histox = np.histogram(filtered_data, bins = int(self.core.lim_max * 10 ** 9 / 5))
+            print("Bin =", Histox)
+            print("Values =", Histoy)
+            #plt.bar(Histox[:-1], Histoy, width=np.diff(Histox), edgecolor='black')
+            #plt.hist(self.core.Moyenner, bins='auto', edgecolor='black')
+            self.ax_result_all_tracks.bar(Histox[:-1], Histoy,width=np.diff(Histox),edgecolor = 'black')
+            #Bin = Histox
+            #plt.bar(Histox[:-1], Histoy, color='blue')
             self.ax_result_all_tracks.set_xlim([self.core.lim_min *10 ** 9, self.core.lim_max * 10 ** 9])
             self.ax_result_all_tracks.set_xlabel("Radius (nm)")
             self.ax_result_all_tracks.set_ylabel("Occurence")
             self.fig_result_all_tracks.canvas.draw()
-
+        elif self.plot_all_track_mode == "Radius Green Histogram":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+            filtered_data = np.array(self.core.Moyenner)[self.core.number_tracks_green]
+            filtered_data = np.array(filtered_data)[np.array(filtered_data) <= self.core.lim_max * 10 ** 9]
+            Histoy, Histox = np.histogram(filtered_data, bins=int(self.core.lim_max * 10 ** 9 / 5))
+            print("Bin =", Histox)
+            print("Values =", Histoy)
+            self.ax_result_all_tracks.bar(Histox[:-1], Histoy, width=np.diff(Histox), edgecolor='black')
+            self.ax_result_all_tracks.set_xlim([self.core.lim_min * 10 ** 9, self.core.lim_max * 10 ** 9])
+            self.ax_result_all_tracks.set_xlabel("Radius (nm) of green track")
+            self.ax_result_all_tracks.set_ylabel("Occurence")
+            self.fig_result_all_tracks.canvas.draw()
+        elif self.plot_all_track_mode == "Radius Red Histogram":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+            filtered_data = np.array(self.core.Moyenner)[self.core.number_tracks_red]
+            filtered_data = np.array(filtered_data)[np.array(filtered_data) <= self.core.lim_max * 10 ** 9]
+            Histoy, Histox = np.histogram(filtered_data, bins=int(self.core.lim_max * 10 ** 9 / 5))
+            print("Bin =", Histox)
+            print("Values =", Histoy)
+            self.ax_result_all_tracks.bar(Histox[:-1], Histoy, width=np.diff(Histox), edgecolor='black')
+            self.ax_result_all_tracks.set_xlim([self.core.lim_min * 10 ** 9, self.core.lim_max * 10 ** 9])
+            self.ax_result_all_tracks.set_xlabel("Radius (nm) of red track")
+            self.ax_result_all_tracks.set_ylabel("Occurence")
+            self.fig_result_all_tracks.canvas.draw()
     def get_selected_track_from_treeview(self):
         id_selected_item = self.tree_view.focus()
         parent_iid = self.tree_view.parent(id_selected_item)

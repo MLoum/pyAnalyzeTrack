@@ -3,6 +3,8 @@ import numpy as np
 import xml.etree.cElementTree as et
 from lmfit import Model
 from scipy.fftpack import dst
+#import CoolProp
+#from CoolProp.CoolProp import PropsSI
 
 #import pandas as pd
 import os
@@ -369,15 +371,19 @@ class AnalyzeTrackCore():
         self.Filter = 10
         self.overlap = 0
         self.overlap_time = []
+        self.number_tracks_green = []
+        self.number_tracks_red = []
         self.min_nb_spot_for_gaussian_fit = 10  #FIXME Hardcoded
         self.min_nb_spot_for_covariance = 10  # FIXME Hardcoded
         self.tracks = None
         self.nTracks = None
         self.frameInterval = None
-        self.space_units_nm = 172.5 # in nm
-        self.timeUnits = 1/120 # in s
+        self.space_units_nm = 240 # pour la caméra ximéa
+        #self.space_units_nm = 172.5 #pour la camera IDS # in nm
+        self.timeUnits = 1/60 # in s
         self.T = 293    #in K
-        self.eta = 0.001    # in Pa.s
+        #self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
+        self.eta = 0.001
         self.sigma_already_known = False
         self.R = 1/6
         self.division = 10
@@ -489,6 +495,8 @@ class AnalyzeTrackCore():
         self.septavariancey_lag = []
         self.octavariancey_lag = []
         self.x_full_gauss = [i for i in np.linspace(self.lim_min*10**9, self.lim_max*10**9, self.nombre)]
+        self.moyenne_error = []
+        self.spots = []
 
 
     def calculate_lag(self, diff_x_1,diff_y_1,track):
@@ -637,7 +645,7 @@ class AnalyzeTrackCore():
         # track.r_cov = track.y_cov
         track.r_cov = track.x_cov
 
-        self.Moyenner.append(track.x_cov * 10 ** 9)
+
         # self.Moyenner.append(track.y_cov*10**9)
 
         zetha = sigma_squarex / (track.D_x * self.timeUnits) - 2 * self.R
@@ -647,14 +655,27 @@ class AnalyzeTrackCore():
         track.x_cov_2 = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * (track.D_x - np.sqrt(Variancex_D)))
 
         Variance = ((track.x_cov_2 - track.x_cov_1) / 2) ** 2
-        # Variance = (track.x_cov / track.D_x ) * Variance_D
-        # Variance = np.sqrt(np.sqrt(MSDx ** 2 + MSDy ** 2) / (track.nSpots - 1))
-        if track.x_cov != 0:
-            self.Gauss1.append((1 / (np.sqrt(Variance * 10 ** 18) * np.sqrt(2 * np.pi))) * np.exp(-(self.x_full_gauss - track.x_cov * 10 ** 9) ** 2 / (2 * Variance * 10 ** 18)))
 
         track.error_r_cov = np.absolute((track.x_cov_2 - track.x_cov_1) / 2)
-        track.error_r_cov = "{:.3e}".format(track.error_r_cov)
-        track.r_cov = "{:.3e}".format(track.r_cov)
+
+        self.spots.append(track.nSpots)
+
+        if track.error_r_cov  >  1*track.r_cov:
+            track.r_cov = np.nan
+            track.error_r_cov = np.nan
+        else:
+            self.moyenne_error.append(track.error_r_cov)
+
+        # Variance = (track.x_cov / track.D_x ) * Variance_D
+        # Variance = np.sqrt(np.sqrt(MSDx ** 2 + MSDy ** 2) / (track.nSpots - 1))
+        if not np.isnan(track.r_cov):
+            #self.Gauss1.append((1 / (np.sqrt(Variance * 10 ** 18) * np.sqrt(2 * np.pi))) * np.exp(-(self.x_full_gauss - track.x_cov * 10 ** 9) ** 2 / (2 * Variance * 10 ** 18)))
+            self.Gauss1.append([1 / (np.sqrt(Variance * 10 ** 18) * np.sqrt(2 * np.pi)) * np.exp(-(x - track.x_cov * 10 ** 9) ** 2 / (2 * Variance * 10 ** 18)) for x in self.x_full_gauss])
+            self.Moyenner.append(track.r_cov * 10 ** 9)
+
+
+        #track.error_r_cov = "{:.3e}".format(track.error_r_cov)
+        #track.r_cov = "{:.3e}".format(track.r_cov)
         #print(track.r_cov)
         
         
@@ -679,6 +700,10 @@ class AnalyzeTrackCore():
 
         self.Lag_all_track()
         self.Moyenne = np.nanmean(self.Moyenner)
+        self.moyenne_spots = np.nanmean(self.spots)
+        print("Moyenne des rayons des tracks =",  self.Moyenne)
+        self.moyenne_error_tot = np.nanmean(self.moyenne_error)
+        print("Moyenne de l'erreur =",self.moyenne_error_tot)
         self.Gauss_full_track = np.nansum(self.Gauss1, axis=0)
         self.Gauss_full_track /= np.max(self.Gauss_full_track)
         Max_value = np.max(self.Gauss_full_track)
@@ -914,6 +939,7 @@ class AnalyzeTrackCore():
                         tracker_red = 1
                     else :
                         tracker_red = 0
+
                     tracker_color.append(tracker_red)
                     position.append((x, y))
             #print(position)
@@ -928,17 +954,20 @@ class AnalyzeTrackCore():
         self.green = 0
         self.compteur_red = 0
         self.compteur_green = 0
-
+        i=0
 
         for track in self.tracks:
+
             for m in range(np.size(track.x)) :
                 Value_red = np.sum(self.video_array_red[int(track.y[m]) - self.Rayon_boite:int(track.y[m]) + self.Rayon_boite,int(track.x[m]) - self.Rayon_boite:int(track.x[m]) + self.Rayon_boite,int(track.t[m]) - 1])
                 Value_green = np.sum(self.video_array_green[int(track.y[m]) - self.Rayon_boite:int(track.y[m]) + self.Rayon_boite,int(track.x[m]) - self.Rayon_boite:int(track.x[m]) + self.Rayon_boite,int(track.t[m]) - 1])
                 if Value_red > Value_green:
                     self.red += 1
+
                 else:
                     if Value_red < Value_green:
                         self.green += 1
+
 
                 #print("Value_red = ", Value_red)
                 #print("Value_green", Value_green)
@@ -950,14 +979,20 @@ class AnalyzeTrackCore():
             #print("stop")
             if self.red > self.green:
                 self.compteur_red += 1
+                if not np.isnan(track.r_cov):
+                    self.number_tracks_red.append(i)
             else:
                 if self.red < self.green:
                     self.compteur_green += 1
+                    if not np.isnan(track.r_cov):
+                        self.number_tracks_green.append(i)
                 if self.red == self.green == 0:
                     Filtre = 1
 
             self.red = 0
             self.green = 0
+            if not np.isnan(track.r_cov):
+                i=i+1
         self.ratio = 100* self.compteur_green / (self.compteur_red + self.compteur_green)
         #print("red =", self.compteur_red)
         #print("green =", self.compteur_green)
@@ -1084,32 +1119,42 @@ class AnalyzeTrackCore():
         self.boundaries_full_gauss = hist
         self.result_fit_full_gauss = result
 
+    #def initialize_data_generate(self):
+
+
+
 
     def generate_brownian_track(self, params_dict):
         #FIXME from params_dict
+        self.initialize_variables()
         T = 293
         eta = 1E-3
-        delta_t_ms = 30
-        nb_of_frame = 20000
-        particle_mean_diam_nm = 50
-        particle_diam_sigma_relative = 0
+        delta_t_ms = 120
+        nb_of_frame = params_dict["nb_frame"]
+        particle_mean_diam_nm = params_dict["Diam1"]
+        particle_mean_diam_nm_2 = params_dict["Diam2"]
+        particle_diam_sigma_relative = params_dict["sigma"]
         dim_box_X_micron = 3000
         dim_box_Y_micron = 3000
         dim_box_Z_micron = 50
-        nb_particle = 100
+        nb_particle = params_dict["nb_particle"]
+        self.moyenne_spots = nb_of_frame
         depth_of_focus_micron = 100
         drift_X_microns_per_frame = 0
         drift_Y_microns_per_frame = 0
+        ratio_monomere = params_dict["ratio_monomere"]
 
-        self.space_units_nm = 263   # in nm
-        self.timeUnits = delta_t_ms/1000   # in s
+        self.space_units_nm = 172.5   # in nm
+        self.timeUnits = 1/delta_t_ms   # in s
         self.T = T
         self.eta = eta
+
+        loc_values = np.random.choice([particle_mean_diam_nm, particle_mean_diam_nm_2], size=nb_particle,p=[ratio_monomere/100,(100-ratio_monomere)/100])
 
 
         kb = 1.380649E-23
 
-        particle_radiuss = np.random.normal(loc=particle_mean_diam_nm/2, scale=particle_mean_diam_nm/2*particle_diam_sigma_relative, size=nb_particle)
+        particle_radiuss = np.random.normal(loc=loc_values/2, scale=loc_values/2*particle_diam_sigma_relative, size=nb_particle)
         mean_diff_coeff = kb * T / (6*np.pi*eta*(particle_mean_diam_nm/2*1E-9))
         diff_coeffs = kb * T / (6*np.pi*eta*(particle_radiuss*1E-9))
 
@@ -1117,9 +1162,8 @@ class AnalyzeTrackCore():
         # mean_nb_spot_pert_track  = 0
         # mean_dwell_time_in_focus_s = (depth_of_focus_micron*1E-9)**2/(2*mean_diff_coeff)
 
-        npParticleType = np.dtype(
-            [('x', np.float), ('y', np.float), ('z', np.float), ('Dtx', np.float), ('Dty', np.float),
-             ('Dtz', np.float)])
+        npParticleType = np.dtype([('x', np.float64), ('y', np.float64), ('z', np.float64), ('Dtx', np.float64), ('Dty', np.float64),
+             ('Dtz', np.float64)])
         particles = np.zeros(nb_particle, dtype=npParticleType)
 
 
@@ -1151,7 +1195,7 @@ class AnalyzeTrackCore():
         # Scaling the displacement with the diffusion coefficient
         mvt_evolution[:]['x'] += dr[:, :, 0] * np.sqrt(2 * particles[:]['Dtx'] * self.timeUnits) * 1E6
         mvt_evolution[:]['y'] += dr[:, :, 1] * np.sqrt(2 * particles[:]['Dty'] * self.timeUnits) * 1E6
-        mvt_evolution[:]['z'] += dr[:, :, 2] * np.sqrt(2 * particles[:]['Dtz'] * self.timeUnits) * 1E6
+        mvt_evolution[:]['z'] += 0 #dr[:, :, 2] * np.sqrt(2 * particles[:]['Dtz'] * self.timeUnits) * 1E6
 
         # Extract track from brownian trajectory
         self.tracks = []
@@ -1189,7 +1233,45 @@ class AnalyzeTrackCore():
 
                         self.tracks.append(track)
         self.nTracks = len(self.tracks)
-        self.analyze_all_tracks()
+
+        params = {
+            "T": self.T,
+            "eta": self.eta,
+            "timeUnits": self.timeUnits,
+            "space_units_nm": self.space_units_nm,
+            "R": self.R,
+            "algo_drift_compensation": self.algo_drift,
+            "min_nb_spot_for_gaussian_fit": self.min_nb_spot_for_gaussian_fit,
+            "min_nb_spot_for_covariance": self.min_nb_spot_for_covariance
+        }
+
+
+
+        for track in self.tracks:
+            track.calculate_D_from_gauss(params)
+            track.calculate_D_from_MSD(params)
+            #self.task_counter += 1
+
+            #if track.nSpots < self.Filter:
+            #    track.is_filtered = True
+            #if track.is_filtered is True:
+            #    track.r_cov = np.nan
+            #else:
+
+            self.process_track(track)
+
+        self.Lag_all_track()
+        self.Moyenne = np.nanmean(self.Moyenner)
+        print("Moyenne des rayons des tracks =", self.Moyenne)
+        self.moyenne_error_tot = np.nanmean(self.moyenne_error)
+        print("Moyenne de l'erreur =", self.moyenne_error_tot * 10**9)
+        self.Gauss_full_track = np.nansum(self.Gauss1, axis=0)
+        self.Gauss_full_track /= np.max(self.Gauss_full_track)
+        Max_value = np.max(self.Gauss_full_track)
+        self.Max_index = np.where(self.Gauss_full_track == Max_value)
+        self.Max_index = self.Max_index[0] * 10 ** -9 + self.lim_min
+        #self.analyze_all_tracks()
+        #self.start
 
     def filter_tracks(self, low1, high1, type1, not1, bool_op, low2, high2, type2, not2):
         #FIXME inclusive frontiere ?
@@ -1250,6 +1332,69 @@ class AnalyzeTrackCore():
                 track.is_filtered = True
             else:
                 track.is_filtered = False
+
+    def save_data_gauss(self,filePath):
+        filename = filePath.name
+        combined_array = np.column_stack((self.x_full_gauss, self.Gauss_full_track))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tValue of the normalized Gaussian\n")
+
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        Histoy, Histox = np.histogram(self.Moyenner, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_red_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        filtered_data = np.array(self.Moyenner)[self.number_tracks_red]
+        nb_bins = int(np.max(filtered_data) / 5)
+        Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_green_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        filtered_data = np.array(self.Moyenner)[self.number_tracks_green]
+        nb_bins = int(np.max(filtered_data) / 5)
+        Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+
+
 
 
     def save_state(self, filename):
