@@ -1,11 +1,42 @@
+"""
+TODO :
+- Reparer les séparations rouge et vert -> Afficher les ratios qq part dans le GUI
+- Reparer le multiprocessor
+- Reparer la somme de gaussienne
+- Voir si j'ai bien la possibilité de travailler par image et non par track (une image avec la position de chaque particule avec leur numéro de track)
+- Tracer les corrélations
+- Script pour voir tester la technique de la somme de gaussienne.
+- Ajouter le code de Marius
+"""
+
+
+
 import matplotlib.pyplot as plt
 import numpy as np
 import xml.etree.cElementTree as et
 from lmfit import Model
 from scipy.fftpack import dst
+#import CoolProp
+#from CoolProp.CoolProp import PropsSI
 
-import pandas as pd
-import multiprocessing as mp
+#import pandas as pd
+import os
+
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Value
+import ctypes
+import tifffile
+from scipy.special import gamma, gammaln
+
+from itertools import repeat
+
+from multiprocessing import Process, Array
+
+import shelve
+import cv2
+
+# This is a GLOBAL variable that is used to track the progress of multicore-calculation.
+# Due to the GIL management and  things, this vairable cannot be in the class ("not pickable").
 
 
 class Track:
@@ -19,166 +50,503 @@ class Track:
     La classe contient plusieurs méthodes pour analyser les données brutes et obtenir les rayons hydrodynamiques etc...
     """
     def __init__(self):
+        self.trackMate_id = None
         self.nSpots = None
         self.quality = None
         self.Filter = None
         self.t, self.x, self.y, self.z = None, None, None, None # In num frame and pixel
+        self.red, self.green = None, None   # Mean Intensity in the red and green channel for each spot.
+        self.r_trackmate = None # Radius in pixel of the particle detected by Trackmate.
         self.diff_x, self.diff_y = None, None
         self.drift_x, self.drift_y = None, None
         self.Dx_gauss, self.Dy_gauss = None, None
         self.Dx_msd, self.Dy_msd = None, None
+        self.msd_x = 0
         self.Dx_cov, self.Dy_cov = None, None
+        self.var_Dx_cov, self.var_Dy_cov = None, None
         self.result_gauss_x, self.result_gauss_y = None, None
 
-        self.r_gauss, self.r_cov = 0, 0
-        self.error_r_gauss, self.error_r_cov = 0, 0
+        self.colors = None  # A list of [r,g,b] value, one for each spot
 
+        self.color = None  # Main color of the track (the most present along the track)
 
+        self.red_mean, self.green_mean = 0, 0
 
-        self.isFiltered = False
+        self.r_gauss, self.r_cov_2 = 0, 0
+        self.error_r_gauss, self.error_r_cov_2, self.error_r_msd = 0, 0, 0
 
-    def gaussian_delta_fit(self):
-        """
-        Cf plutôt la même méthode dans la classe AnalyzeTrackCore
-        :return:
-        """
-        def gaussian(x, amp, cen, wid):
-            """
-            Une gaussienne (non normalisée) est définie par :
-            exp(-1/2 (x-µ)²/σ²
+        # Display attribute
+        self.is_filtered = False
+        self.is_highlighted = False
 
-            où µ est la moyenne
-            et σ est l'écart type (standart deviation) avec donc σ² <=> Variance.
-            ici wid est égale à 2 σ²
-            :param x:
-            :param amp:
-            :param cen: µ
-            :param wid: 2 σ²
-            :return:
-            """
-            return amp * np.exp(-(x - cen) ** 2 / wid)
-
-        x_diff = np.diff(self.x)
-        hist_x, boundaries_x = np.histogram(x_diff)
-        boundaries_x = boundaries_x[0:-1]
-        gmodel = Model(gaussian)
-        params = gmodel.make_params(cen=np.mean(x_diff), amp=np.max(hist_x), wid=np.std(x_diff))
-
-        result_x = gmodel.fit(hist_x, params, x=boundaries_x)
-        self.result_gauss_x = result_x
-        self.drift_x = result_x.params["cen"]
-        self.width_x = result_x.params["wid"]
-
-        y_diff = np.diff(self.y)
-        hist_y, boundaries_y = np.histogram(y_diff)
-        boundaries_y = boundaries_y[0:-1]
-        gmodel = Model(gaussian)
-        params = gmodel.make_params(cen=np.mean(y_diff), amp=np.max(hist_y), wid=np.std(y_diff))
-        result_y = gmodel.fit(hist_y, params, x=boundaries_y)
-        self.result_gauss_y = result_y
-        self.drift_y = result_y.params["cen"]
-        self.width_y = result_x.params["wid"]
-
-        return hist_x, boundaries_x, hist_y, boundaries_y, result_x, result_y
-
-    def msd(self):
-        """
-        A implementer par principe même si la méthode n'est pas la bonne pour le mouvement brownien libre.
-        :return:
-        """
-        pass
-
-
-
-
-    def test_free_diffusion_via_MSD(self, algo="None"):
-        """
-        Pour un mouvement brownien libre :
-        <Δx_n²> = 2 D Δt  + 2 (σ² - 2 D R Δt)
-        <Δx_n Δx_n+1> ≠ 0 = - (σ² - 2 D R Δt)
-        Tous les autres <Δx_n Δx_m> = 0
-
-        On teste ici si les <Δx_n Δx_m> = 0. Ils doivent être reparties autour de zero.
-        Cela est très facilement remis en question s'il y a du drift qui n'est pas bien corrigé.
-        :param algo:
-        :return:
-        """
-        nb_msd = min(15, self.nSpots)
-        self.test_msd_x = np.zeros(nb_msd)
-        self.test_msd_y = np.zeros(nb_msd)
-
-        for i in range(nb_msd):
-            self.test_msd_x[i] = np.mean(self.diff(self.x, i+1), algo)
-            self.test_msd_y[i] = np.mean(self.diff(self.y, i + 1), algo)
-
-    def test_free_diffusion_via_periodogram(self):
-        """
-        Analyse du spectre en Discrete Sinus Fourier Transform
-        :return:
-        """
-        # TODO
-        pass
-
-    def diff(self, array, n=1, algo="None"):
-        """
-
-        :param array:
-        :param n:
-        :return:
-        """
-        if algo == "None":
-            return array[n:] - array[:-n]
-        elif algo == "self":
-            (array[n:] - np.mean(array[n:])) - (array[:-n] - np.mean(array[:-n]))
-
-
-
-    def evol_drift(self, window_length_ratio):
-        """
-        Etude de la moyenne des Delta x (<Δx>) au cours de la trajectoire.
-        :param window_length_ratio:
-        :return:
-        """
-        def running_mean(x, N):
-            cumsum = np.cumsum(np.insert(x, 0, 0))
-            return (cumsum[N:] - cumsum[:-N]) / float(N)
-
-        filter_length = int(self.x * window_length_ratio)
-        return running_mean(self.x, filter_length)
-
-    def get_deltas(self, algo="None"):
+    def calculate_displacement(self, pos, algo="None", step=1):
         """
         Return the list of all displacement Δx, defined as Δx = x[i+1] - x[i], while taking into account an eventual drift (cf algo)
-        :param algo: Algorithm for drift compensation.
-        "self" remove the mean of the data from all displacements
+
+        :param algo: Algorithm for drift compensation (https://tinevez.github.io/msdanalyzer/tutorial/MSDTuto_drift.html) :
+        "None" : no correction
+        "itself" :  remove the mean of the data from all displacements
+        "neighbors" : to be implemented
         :return:
         """
         if algo == "None":
-            return np.diff(self.x), np.diff(self.y)
-        elif algo == "self":
-            return np.diff(self.x) - np.mean(self.x), np.diff(self.y) - np.mean(self.y)
+            return np.diff(pos,step)
+        elif algo == "itself":
+            return np.diff(pos  - np.mean(pos),step)
         elif algo == "neighbors":
             # TODO
-            return np.diff(self.x), np.diff(self.y)
+            return np.diff(pos), np.diff(pos)
+
+    def calculate_D_from_gauss(self, params):
+        """
+        Estime la valeur du coefficient de diffusion en fittant l'histogramme des déplacements (i.e. Δx) par une gaussienne.
+        Plus précisement, la largeur de la gaussienne permet de remonter au coefficient de diffusion.
+        La position du centre de la gaussienne permet de remonter à un eventuel drift.
+
+        Mathématiquement la largeur de la gaussienne  est relié à sa variance Var (Δx)
+        Var (Δx) = <Δx²> - (<Δx>)²
+        <Δx²> est la MSD est on peut en déduire le coefficient de diffusion via  <Δx²> = 2 D Δt
+
+        (<Δx>)² est le carré de la moyenne, on peut en déduire une estimation, c'est le centre de la gaussienne.
+        Var (Δx) provient de l'ajustement de l'histogramme par une gaussienne.
+        :return:
+        """
+        kb_ = 1.38E-23
+        algo_drift_compensation = params["algo_drift_compensation"]
+        min_nb_spot_for_gaussian_fit = params["min_nb_spot_for_gaussian_fit"]
+        #isotroptic_diff = params["isotroptic_diff"]
+        isotroptic_diff = True
+
+        def gaussian_delta_fit(pos, algo_drift_compensation="None"):
+            """
+            :param pos: Tableau contenant les positions au cours du temps. Peut être à deux (ou plus dimensions si on prend en compte à la flois l'axe x et l'axe y
+            :param algo_drift_compensation:
+            :return:
+            """
+
+            def gaussian(x, amp, cen, wid):
+                """
+                A Gaussian (unnormalized) is defined by:
+
+                \[ \exp\left(-\frac{1}{2} \frac{(x-\mu)^2}{\sigma^2}\right) \]
+
+                where \(\mu\) is the mean and \(\sigma\) is the standard deviation, thus \(\sigma^2\) corresponds
+                to the variance. Here, \( \text{wid} \) is equal to \( 2\sigma^2 \), i.e. two times the variance
+                :param x:
+                :param amp:
+                :param cen: µ
+                :param wid: 2 σ²
+                :return:
+                """
+                return amp * np.exp(-(x - cen) ** 2 / wid)
+
+            if isinstance(pos, list):
+                diff_list = []
+                for p in pos:
+                    diff_list.append(self.calculate_displacement(p, algo_drift_compensation))
+                diff = np.concatenate(diff_list)
+            else:
+                diff = self.calculate_displacement(pos, algo_drift_compensation)
+
+            # In order to get an histogramm we have to choose a binning method we rely on "sturges" (see https://indico.cern.ch/event/428334/contributions/1047042/attachments/919069/1299634/ChoosingTheRightBinWidth.pdf)
+            hist, boundaries = np.histogram(diff, bins="sturges")
+            boundaries = boundaries[0:-1]
+            # We use lmfit for fitting the histogram of the displacement Δx by a gaussian
+            gmodel = Model(gaussian, nan_policy='raise')
+            # We calculate rough estimate of the amplitude (max) and the width (std) of the gaussian that we use as initial guess
+            # and set limits for the parameters
+            max_, min_ = np.max(hist), np.min(hist)
+            max_bound, min_bound = np.max(boundaries), np.min(boundaries)
+            params = gmodel.make_params(cen=np.mean(diff), amp=max_, wid=np.std(diff))
+            #FIXME fix initial guess ?
+            params["amp"].min = 0
+            params["amp"].max = 2 * max_
+
+            params["wid"].min = 0
+            params["cen"].min = min_bound
+
+            params["cen"].max = max_bound
+            params["wid"].max = max_bound - min_bound
+
+            try:
+                result = gmodel.fit(hist, params, x=boundaries)
+            except ValueError:
+                return None, None, None, None, None, None
+
+            return diff, hist, boundaries, result, result.params["cen"], result.params["wid"]
+
+        def D_from_fit(center, width, nb_spot, params):
+            T = params["T"]
+            eta = params["eta"]
+
+            timeUnits = params["timeUnits"]
+            space_units_nm = params["space_units_nm"]
+
+            mean_squared_SI = (center * space_units_nm * 1E-9) ** 2
+            variance_SI = (width * space_units_nm * space_units_nm * 1E-18) / 2 # /2 because the fit gives the width = 2 * σ² = 2 * Variance
+            #FIXME Cela me semble faux de ne pas prendre en compte la moyenne. On l'a peut-etre compenser, mais alors on doit avoir presque zero
+            msd = variance_SI  # Or: msd = variance_SI + mean_squared_SI, depending on your needs
+            #msd = variance_SI + mean_squared_SI # Give slightly lower values...
+            D_gauss = msd / (2 * timeUnits)
+            r_gauss = kb_ * T / (6 * np.pi * eta * D_gauss)
+
+            error_D = D_gauss * np.sqrt(2/(nb_spot - 1)) # Sampling error see "Improving the quantification of Brownian motion"
+            error_r_gauss = kb_ * T / (6 * np.pi * eta * D_gauss**2) * error_D
+
+            return D_gauss, r_gauss, error_r_gauss
+
+        if self.nSpots < min_nb_spot_for_gaussian_fit:
+            self.Dx_gauss = -100
+            self.Dy_gauss = -100
+            self.r_gauss = -1E6
+            return
+
+
+
+        diff, hist, boundaries, result, center, width = gaussian_delta_fit(self.x, algo_drift_compensation)
+
+        self.gauss_diffX_hist = hist
+        self.gauss_diffX_hist_abs = boundaries
+        self.gauss_diffX_result = result
+        # Test if the fit converged by looking for instance at the first returned value
+        nb_spot_x = len(self.x)
+        if diff is not None:
+            self.Dx_gauss, rx, error_rx = D_from_fit(center.value, width.value, nb_spot_x, params)
+        else:
+            # A big negative number
+            self.Dx_gauss = -100
+            rx = -1E6
+
+        diff, hist, boundaries, result, center, width = gaussian_delta_fit(self.y, algo_drift_compensation)
+        self.gauss_diffY_hist = hist
+        self.gauss_diffY_hist_abs = boundaries
+        self.gauss_diffY_result = result
+        nb_spot_y = len(self.y)
+        # Test if the fit converged by looking for instance at the first returned value
+        if diff is not None:
+            self.Dy_gauss, ry, error_ry = D_from_fit(center.value, width.value, nb_spot_y,  params)
+        else:
+            # A big negative number
+            self.Dy_gauss = -100
+            ry = -1E6
+
+        # If we assume there is an isotropic diffusion, we can concatenate the list of displacement along x and y
+        # And fit it with the same gaussian
+
+        diff, hist, boundaries, result, center, width = gaussian_delta_fit([self.x, self.y], algo_drift_compensation)
+        self.gauss_diff_hist = hist
+        self.gauss_diff_hist_abs = boundaries
+        self.gauss_diff_result = result
+        nb_spot = nb_spot_x + nb_spot_y
+        self.D_gauss, self.r_gauss, self.r_gauss_err = D_from_fit(center.value, width.value, nb_spot, params)
+
+        #self.r_gauss = (rx + ry)/2
+
+
+    def calculate_D_from_MSD(self, params):
+        kb_ = 1.38E-23
+        T = params["T"]
+        eta = params["eta"]
+        timeUnits = params["timeUnits"]
+        space_units_nm = params["space_units_nm"]
+        algo_drift_compensation = params["algo_drift_compensation"]
+        min_nb_spot_for_covariance = params["min_nb_spot_for_covariance"]
+
+        def caculate_MSD_1D(pos, params):
+
+            #FIXME pourquoi les deux codes ne donnent pas les même resultats. On ne peut pas enlever le drift dès le début ?
+            # diff = self.calculate_displacement(pos * space_units_nm * 1E-9, params["algo_drift_compensation"])
+            # MSD = np.mean(diff ** 2)
+
+            diff = self.calculate_displacement(pos * space_units_nm * 1E-9, algo="None")
+            drift = np.nanmean(diff)
+            MSD = np.mean((diff - drift) ** 2)
+
+            return MSD
+
+        if self.nSpots < min_nb_spot_for_covariance:
+            self.Dx_msd, self.Dy_msd, self.r_msd = -1, -1, -1
+            return
+
+
+        MSD = caculate_MSD_1D(self.x, params)
+        self.Dx_msd = MSD / (2 * timeUnits)
+        if self.Dx_msd == 0:
+            self.Dx_msd, self.Dy_msd, self.r_msd = -1, -1, -1
+            return
+
+        r_msd_x = kb_ * T / (6 * np.pi * eta * self.Dx_msd)
+        MSD = caculate_MSD_1D(self.y, params)
+        self.Dy_msd = MSD / (2 * timeUnits)
+        if self.Dy_msd == 0:
+            self.Dx_msd, self.Dy_msd, self.r_msd = -1, -1, -1
+            return
+        r_msd_y = kb_ * T / (6 * np.pi * eta * self.Dy_msd)
+
+        self.r_msd = (r_msd_x + r_msd_y)/2
+
+    def calculate_D_from_covariance(self, params):
+        """
+        For each track we compute the deplacement of each particule for each frame. Thanks to that we can deduct the
+        diffusion coefficient of the brownian movement which give us the size of the particule. We account for the experimentals errors like
+        a convection motion in the solution or the errors created by the acquisition of the frames.
+
+        We separate the X axis and the Y axis for each particle which in theory should have no difference since the particles rotates,
+        even if the particule isnt spherical the movement on each axes is blended together in the long term.
+
+        We also use the displacement to compute the lags and the covariance of each track, this indicate if the track is close to what would be expected
+        of a perfect brownian motion which is supposed to have no memory between each displacement. Of course for each analysis we compute the error.
+
+
+        <(Δx_n)²> = 2.D.Δt + 2(σ² − 2.D.R.Δt)
+                                   -----------------
+                                           ^
+                                           |
+                                           |- Due to the error of localisation σ and motion blur (R : motion blur coefficient)
+
+        < Δx_n . Δx_(n+1)> = - (σ² − 2.D.R.Δt)  NB : Non zero covariance. Should be 0 for a memoryless perfect Brownian motion.
+        We can inverse these equations to find :
+                <(Δx_n)²> - 2 . σ²
+        D = ---------------------------
+                2 . (1 - 2.R) . Δt
+
+        σ² = R <(Δx_n)²> + (2.R - 1) . < Δx_n . Δx_(n+1)>
+
+        with the variance on D equals to :
+
+                       2 ∈² + 4 ∈ + 6     4 (1 + ∈)²
+        var(D) = D² [ ---------------- + ------------ ]
+                             N                N²
+
+        ∈ = σ² / (D Δt) - 2 R
+
+        :param track:
+        :return:
+        """
+
+        kb_ = 1.38E-23
+        R = params["R"]
+        T = params["T"]
+        eta = params["eta"]
+        timeUnits = params["timeUnits"]
+        space_units_nm = params["space_units_nm"]
+        min_nb_spot_for_covariance = params["min_nb_spot_for_covariance"]
+        algo_drift_compensation = params["algo_drift_compensation"]
+
+        def caculate_cov_1D(pos, params):
+            # diff = self.calculate_displacement(pos * space_units_nm * 1E-9, algo=params["algo_drift_compensation"])
+            # MSD = np.mean(diff ** 2)
+
+            diff = self.calculate_displacement(pos * space_units_nm * 1E-9, algo="None")
+
+            #FIXME implement other drift compensation algorithm ?
+            drift = np.nanmean(diff)
+            MSD = np.mean((diff - drift) ** 2)
+
+            # covariance = np.mean((diff[:-1]) * (diff[1:]))
+            covariance = np.mean((diff[:-1] - drift) * (diff[1:] - drift))
+
+            sigma_square = R * MSD + (2 * R - 1) * covariance
+            D_cov = (MSD - 2 * sigma_square) / ((2 - 4 * R) * timeUnits)
+            #FIXME why does it happen ?
+            if D_cov <= 0:
+                return -1, -1, -1, -1
+            r_cov_2 = (kb_ * T) / (6 * np.pi * eta * D_cov)
+
+            epsilon = sigma_square / (D_cov * timeUnits) - 2 * R
+            N = self.nSpots
+            var_D_cov_first_order = (6 + 4 * epsilon + 2 * epsilon ** 2) / N
+            var_D_cov_second_order =  (4 * (1 + epsilon)**2) / (N ** 2)
+            var_D_cov = D_cov**2 * ( var_D_cov_first_order + var_D_cov_second_order)
+            var_D_cov = np.sqrt(var_D_cov)
+            error_r_cov = kb_ * T / (6 * np.pi * eta * D_cov ** 2) * var_D_cov
+            var_r_cov = error_r_cov
+
+            return D_cov, r_cov_2, var_D_cov, var_r_cov
+
+        if self.nSpots < min_nb_spot_for_covariance:
+            self.Dx_cov, self.Dy_cov, self.r_cov, self.error_r_cov = -1, -1, -1, -1
+            return -1, -1, -1, -1
+
+
+        self.Dx_cov, rx_cov, self.var_Dx_cov, self.var_rx_cov = caculate_cov_1D(self.x, params)
+        self.Dy_cov, ry_cov, self.var_Dy_cov, self.var_ry_cov = caculate_cov_1D(self.y, params)
+        self.r_cov = (rx_cov + ry_cov)/2
+        self.D_cov = (self.Dx_cov + self.Dy_cov) / 2
+        self.error_r_cov = (self.var_rx_cov + self.var_ry_cov)/2
+
+
+    def get_full_MSD(self, positions):
+        """
+        Calculate the Mean Squared Displacement (MSD) from successive positions of a particle.
+
+        Parameters:
+        positions (tuple of np.ndarray): A tuple containing two arrays, (x, y) positions of the particle.
+
+        Returns:
+        np.ndarray: An array of MSD values for each time interval.
+        """
+        x, y = positions
+        N = len(x)
+        self.full_msd = np.zeros(N)
+
+        """
+        for t in range(1, N):
+            dx = x[t:] - x[:-t]
+            dy = y[t:] - y[:-t]
+            squared_displacements = dx ** 2 + dy ** 2
+            self.full_msd[t] = np.mean(squared_displacements)
+        """
+        for t in range(1, N):
+            deltas = np.vstack((x[t:] - x[:-t], y[t:] - y[:-t]))
+            squared_displacements = np.sum(deltas ** 2, axis=0)
+            self.full_msd[t] = np.mean(squared_displacements)
+
+        return self.full_msd
+    def extract_colored_ROI(self, video_frames, color):
+
+        # NB : Vectorized
+        # Keep only the frame corresponding to the track
+        if video_frames is None:
+            # No movie associated with the track. We keep the default values
+            return
+
+        selected_frames = video_frames[self.t]
+
+        #Array of Top left corner coordinates
+        x_start = max(self.x - self.r_trackmate, 0)
+        y_start = max(self.y - self.r_trackmate, 0)
+
+        #Array of Bottomp right corner coordinates
+        x_end = min(self.x + self.r_trackmate, selected_frames.shape[1] - 1)
+        y_end = min(self.y + self.r_trackmate, selected_frames.shape[0] - 1)
+
+        if color == "red":
+            self.red = np.mean(selected_frames[y_start :y_end+1, x_start:x_end+1])
+            self.red_mean = np.mean(self.red)
+        elif color == "green":
+            self.green = np.mean(selected_frames[y_start :y_end+1, x_start:x_end+1])
+            self.green_mean = np.mean(self.green)
+
+"""
+En dehors des class pour pouvoir le sérialiser lors des processus multicore
+"""
+def init_track(data, params):
+    """
+    Using ProcessPoolExecutor has the disadvantage that each child process runs in its own memory space,
+    separate from the parent process. This means that any changes made to an object in the child process
+    will not be reflected in the parent process.
+    Solution:
+    Return the modified object: return the modified object from the function you're mapping,
+    and then use these returned objects to update the list in the parent process.
+
+    :param data:
+    :return:
+    """
+    track = Track()
+    #TODO the value of the columns are yet "magic numbers", we should identify them in the header instead of relying on a given order
+    #FIXME est ce que 1 est le bon index pour le trackID ?
+    track.trackMate_id = data[0, 1] # Here we take only one value, since its should be all the same.
+    track.spot_ids = data[:, 0]
+    
+    
+    track.quality = data[:, 2]
+    track.x = data[:, 3]
+    track.y = data[:, 4]
+    track.z = data[:, 5]
+    track.t = data[:, 6]
+    track.r_trackmate = data[:, 8] # This is the "RADIUS" column, the value is fixed and correspond to the one given by the user during the spot detection.
+    # track.r_trackmate = data[:, 17] # This is ESTIMATED_DIAMETER, should be better.
+    #TODO Add contrast and/or SNR.
+
+    track.nSpots = track.x.size
+
+    track.calculate_D_from_gauss(params)
+    track.calculate_D_from_MSD(params)
+    track.calculate_D_from_covariance(params)
+
+    # Ini value for colors -> no color since the tracking was done with a grey value movie
+    track.colors = [0, 0 ,0]
+    track.color = None
+
+    #FIXME external counter in order to monitor calculation
+    #global task_counter
+    #task_counter += 1
+    #print("task_counter = ", task_counter)
+
+    return track
+
+
+
+class Spot():
+    """
+    A spot is a detected particle. It belong to a track.
+    """
+
+    def __init__(self):
+        self.x = None # position in ?
+        self.y = None # position in ?
+        self.parent_track = None 
+        self.num = None
+        self.id = None
+        self.color = [0, 0, 0] # RGB
+
+class Frame():
+    """
+    The data can be organized as track where we follow a particle during its tracking
+    The same data can also be organized as frames. A frame is a single image of the movie.
+    More precisely, it does contain the pixel data of the corresponding image but also the position 
+    of all its spot and for each spot the corresponding track
+    """
+    
+    def __init__(self):
+        self.img = None # The raw pixel data of the frame in [R,G,B] format
+        self.num = -1 # The frame number of the full movie
+        self.spots = None # List of the spots detected inside this frame
+    
+               
 
 class AnalyzeTrackCore():
     """
 
     """
     def __init__(self):
-        self.Filter = 10
-        self.tracks = None
-        self.nTracks = None
-        self.frameInterval = None
-        self.space_units_nm = 263 # in nm
-        self.timeUnits = 1/60   # in s
-        self.T = 293    #in K
-        self.eta = 0.001    # in Pa.s
-        self.sigma_already_known = False
-        self.R = 1/6
-        self.division = 10
+        self.Filter = 10    # ?
+        self.overlap = 0    # ?
+        self.overlap_time = []
+        self.number_tracks_green = []
+        self.number_tracks_red = []
 
-        self.algo_drift = "self"
+        self.min_nb_spot_for_gaussian_fit = 10  #FIXME Hardcoded
+        self.min_nb_spot_for_covariance = 10  # FIXME Hardcoded
+        self.tracks = None # List of the track object
+        self.nTracks = None
+        self.frames = None # List of Frame objects
+        self.nFrames = 0
+        self.frameInterval = None
+        self.space_units_nm = 240 # pour la caméra ximéa -> FIXME Hardcoded
+        #self.space_units_nm = 172.5 #pour la camera IDS # in nm
+        self.frame_rate = 1 / 60 #   # FIXME Harcoded
+        self.T = 293    #in K
+        #self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
+        self.eta = 0.001
+        self.sigma_already_known = False
+        self.R = 1/6    #FIXME ?
+        self.division = 10
+        self.tracker = 0
+
+        self.is_computing = False
+
+        self.executor = None
+
+        self.algo_drift = "itself"
+
+        # Tracking of the calculations progresses
+        self.tasks_completed = Value(ctypes.c_int, 0)
+        self.current_task = "Idle"
+        self.task_counter = 0
+
+        self.kb = 1.380649E-23
 
 
     def viscosity_from_temperature(self, solvent="water", T=293):
@@ -188,715 +556,762 @@ class AnalyzeTrackCore():
 
         return None
 
+    def radius_nm_from_coeff_diff(self, D_SI):
+        return self.kb * self.T / (6 * np.pi * self.eta * D_SI)*1E9
+
     def change_filter(self, Valeur):
         self.Filter = int(Valeur.get())
 
-    def get_sublists(self,original_list, sublists_number):
-        list_size = len(original_list)
-        sublist_size_except_last = list_size // sublists_number
-        last_sublist_size = list_size % sublists_number
-        sublists = list()
-        l_index = 0
-        r_index = list_size - 1
 
-        for i in range(sublists_number):
-            l_index = (i * sublist_size_except_last)
-            r_index = ((i + 1) * sublist_size_except_last) - 1
-            if i != sublists_number - 1:
-                sublists.append(original_list[l_index:r_index + 1])
-            else:
-                r_index = r_index + last_sublist_size
-                sublists.append(original_list[l_index:r_index + 1])
+    def load_data(self, params):
+        self.is_computing = True
 
-        return sublists
+        self.load_TrackData_txt(params)
 
+        if params["filepath_video"] != "None":
+            self.load_VideoData(params)
+        else:
+            self.red_frames = None
+            self.green_frames = None
 
-    def covariance(self , sigma_square=None, algo_drift="self"):
+        self.is_computing = False
+
+    def load_TrackData_txt(self, params):
         """
-        Calcul du coefficeint de diffusion D à partir de la covariance :
+        We use Trackmate to get the tracks. Its format output is a text file with :
+        - a header line with name of the paremeter separated by a space :
+        e.g. LABEL ID TRACK_ID QUALITY POSITION_X POSITION_Y POSITION_Z POSITION_T FRAME RADIUS VISIBILITY MANUAL_SPOT_COLOR MEAN_INTENSITY_CH1 MEDIAN_INTENSITY_CH1 MIN_INTENSITY_CH1 MAX_INTENSITY_CH1 TOTAL_INTENSITY_CH1 STD_INTENSITY_CH1 CONTRAST_CH1 SNR_CH1
 
-        Vestergaard, C. L., Blainey, P. C., & Flyvbjerg, H. (2014).
-        Optimal estimation of diffusion coefficients from single-particle trajectories.
-        Physical Review E - Statistical, Nonlinear, and Soft Matter Physics, 89(2).
-        https://doi.org/10.1103/PhysRevE.89.022726
-        :param Delta_t:
-        :param R:
-        :param sigma_square: Erreur de localisation qui peut être mesurée ou estimée à partir des
-        :return:
+        - When the txt data has been converted we analyze it in order to get its Diffusion Coefficient
+
+        :param params: A dictionnary with a key filepath_track for the path of the txt file exported from Trackmate
+        :return: FIXME !
         """
-        self.taille =[]
-        self.Spectre = []
-        self.Spectre_mean = []
-        self.Spectre_moyenne = []
-        self.Moyennex = 0
-        self.Moyenney = 0
-        self.Moyenner = []
-        self.Controle = []
-        self.Controle_variance =[]
-        self.Controle_track = np.array([])
-        self.lim_min = 0*10**-9
-        self.lim_max = 200*10**-9
-        self.nombre =int((self.lim_max*10**9 - self.lim_min*10**9)+1)
-        Moyenner=[]
-        Gauss1 = []
-        Gauss =[]
-        self.MSDx_lag =[]
-        self.covariancex_lag=[]
-        self.trivariancex_lag =[]
-        self.quadravariancex_lag=[]
-        self.pentavariancex_lag=[]
-        self.sixtvariancex_lag=[]
-        self.septavariancex_lag=[]
-        self.octavariancex_lag=[]
-        self.MSDx_lag_variance = []
-        self.covariancex_lag_variance = []
-        self.trivariancex_lag_variance = []
-        self.quadravariancex_lag_variance = []
-        self.pentavariancex_lag_variance = []
-        self.sixtvariancex_lag_variance = []
-        self.septavariancex_lag_variance = []
-        self.octavariancex_lag_variance = []
-        self.MSDy_lag = []
-        self.covariancey_lag = []
-        self.trivariancey_lag = []
-        self.quadravariancey_lag = []
-        self.pentavariancey_lag = []
-        self.sixtvariancey_lag = []
-        self.septavariancey_lag = []
-        self.octavariancey_lag = []
+        self.current_task = "Track Data loading"
 
-        i=0
-        # FIXME  absicsse basée sur les données
-        self.x_full_gauss = [i for i in np.linspace(self.lim_min*10**9, self.lim_max*10**9, self.nombre)]
+        filepath = params["filepath_track"]
 
-        # TODO sigma (bruit localisation) à partir des données de la track ou alors sigma
-        # moyen sur l'ensemble des tracks ou alors sigma utilisateur
-
-        # TODO work in progress
-        for track in self.tracks:
-            if track.nSpots < self.Filter :
-                track.isFiltered = True
-            if track.isFiltered is True :
-                track.r_cov = np.nan
-            else:
-                i = i+1
-
-                diff_x_1 = self.calculate_displacement(track.x*self.space_units_nm*10**-9, algo="None")
-
-                driftx = np.nanmean(diff_x_1)
-                #driftx = 0
-
-                MSDx = np.mean((diff_x_1-driftx) ** 2)
-                covariancex = np.mean((diff_x_1[:-1]-driftx) * (diff_x_1[1:]-driftx))
-
-
-                self.MSDx_lag.append(np.mean((diff_x_1) * (diff_x_1)))
-                self.covariancex_lag.append(np.mean((diff_x_1[:-1] ) * (diff_x_1[1:] )))
-                self.trivariancex_lag.append(np.mean((diff_x_1[:-2] ) * (diff_x_1[2:] )))
-                self.quadravariancex_lag.append(np.mean((diff_x_1[:-3] ) * (diff_x_1[3:] )))
-                self.pentavariancex_lag.append(np.mean((diff_x_1[:-4] ) * (diff_x_1[4:] )))
-                self.sixtvariancex_lag.append(np.mean((diff_x_1[:-5] ) * (diff_x_1[5:] )))
-                self.septavariancex_lag.append(np.mean((diff_x_1[:-6] ) * (diff_x_1[6:] )))
-                self.octavariancex_lag.append(np.mean((diff_x_1[:-7] ) * (diff_x_1[7:] )))
-
-
-
-
-
-                sigma_squarex = self.R * MSDx + (2 * self.R - 1) * covariancex
-                track.D_x = (MSDx - 2*sigma_squarex) / ((2-4*self.R)*self.timeUnits)
-                track.x_cov =(1.38*10**(-23)*self.T)/(6*np.pi*self.eta*track.D_x)
-                alpha = 2*track.D_x*self.timeUnits
-                beta = sigma_squarex - 2*track.D_x*self.timeUnits*self.R
-                self.Spectre.append((2 * (0.5*self.timeUnits*dst(diff_x_1,type = 1)) ** 2) / ((track.nSpots + 1) * self.timeUnits * track.D_x * (self.timeUnits) ** 2))
-
-                x1 = self.get_sublists(self.Spectre[i-1], self.division)
-                self.taille.append(np.size(x1[0]))
-                for j in range(self.division) :
-                    self.Spectre_moyenne = np.append(self.Spectre_moyenne,np.mean(x1[j]))
-
-                self.Spectre_mean.append(self.Spectre_moyenne)
-                self.Spectre_moyenne = []
-
-                self.MSDx_lag_variance.append(0)
-                self.covariancex_lag_variance.append(0)
-                self.trivariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 2)) - ((2 * beta ** 2) / ((track.nSpots - 2) ** 2)))
-                self.quadravariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 3)) - ((2 * beta ** 2) / ((track.nSpots - 3) ** 2)))
-                self.pentavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 4)) - ((2 * beta ** 2) / ((track.nSpots - 4) ** 2)))
-                self.sixtvariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 5)) - ((2 * beta ** 2) / ((track.nSpots - 5) ** 2)))
-                self.septavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 6)) - ((2 * beta ** 2) / ((track.nSpots - 6) ** 2)))
-                self.octavariancex_lag_variance.append(((alpha + 4 * alpha * beta + 6 * beta ** 2) / (track.nSpots - 7)) - ((2 * beta ** 2) / ((track.nSpots - 7) ** 2)))
-
-                if np.abs(track.x_cov) > 200*10**-9:
-                    track.x_cov = 0
-                if track.x_cov == np.nan:
-                    self.Moyennex = self.Moyennex
-                else:
-                    self.Moyennex = self.Moyennex + track.x_cov
-
-                diff_y_1 = self.calculate_displacement(track.y * self.space_units_nm*10**-9, algo="None")
-
-                drifty = np.nanmean(diff_y_1)
-                MSDy = np.mean((diff_y_1 - drifty) ** 2)
-                covariancey = np.mean((diff_y_1[:-1] - drifty) * (diff_y_1[1:] - drifty))
-
-                self.MSDy_lag.append(np.mean((diff_y_1) * (diff_y_1)))
-                self.covariancey_lag.append(np.mean((diff_y_1[:-1]) * (diff_y_1[1:])))
-                self.trivariancey_lag.append(np.mean((diff_y_1[:-2]) * (diff_y_1[2:])))
-                self.quadravariancey_lag.append(np.mean((diff_y_1[:-3]) * (diff_y_1[3:])))
-                self.pentavariancey_lag.append(np.mean((diff_y_1[:-4]) * (diff_y_1[4:])))
-                self.sixtvariancey_lag.append(np.mean((diff_y_1[:-5]) * (diff_y_1[5:])))
-                self.septavariancey_lag.append(np.mean((diff_y_1[:-6]) * (diff_y_1[6:])))
-                self.octavariancey_lag.append(np.mean((diff_y_1[:-7]) * (diff_y_1[7:])))
-
-
-                sigma_squarey = self.R * MSDy + (2 * self.R - 1) * covariancey
-                track.D_y = (MSDy - 2 * sigma_squarey) / ((2 - 4 * self.R) * self.timeUnits)
-                track.y_cov = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * track.D_y)
-
-                if np.abs(track.y_cov) > 200*10**-9:
-                    track.y_cov = 0
-                if track.y_cov == np.nan:
-                    self.Moyenney = self.Moyenney
-                else:
-                    self.Moyenney = self.Moyenney + track.y_cov
-
-
-                track.r_cov = track.x_cov
-
-                self.Moyenner.append(track.x_cov*10**9)
-                #self.Moyenner.append(track.y_cov*10**9)
-
-                zetha = sigma_squarex/(track.D_x*self.timeUnits) - 2*self.R
-
-                Variancex_D = track.D_x**2 * ((6 + 4 * zetha + 2 * zetha**2) / (track.nSpots) + (4 * (1 + zetha)**2) / (track.nSpots**2))
-                track.x_cov_1 = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * (track.D_x+np.sqrt(Variancex_D)))
-                track.x_cov_2 = (1.38 * 10 ** (-23) * self.T) / (6 * np.pi * self.eta * (track.D_x-np.sqrt(Variancex_D)))
-
-                Variance = ((track.x_cov_2 - track.x_cov_1)/2)**2
-                #Variance = (track.x_cov / track.D_x ) * Variance_D
-                #Variance = np.sqrt(np.sqrt(MSDx ** 2 + MSDy ** 2) / (track.nSpots - 1))
-                if track.x_cov != 0:
-                    Gauss1.append((1/(np.sqrt(Variance*10**18)*np.sqrt(2*np.pi)))*np.exp(-(self.x_full_gauss-track.x_cov*10**9)**2/(2*Variance*10**18)))
-
-                track.error_r_cov = np.absolute((track.x_cov_2 - track.x_cov_1)/2)
-                track.error_r_cov =  "{:e}".format(track.error_r_cov)
-                track.r_cov =  "{:e}".format(track.r_cov)
-
-
-        #TODO check and y axis
-        Moyenne = np.nanmean(Moyenner)
-        self.Gauss_full_track = np.nansum(Gauss1,axis = 0)
-        self.Gauss_full_track /= np.max(self.Gauss_full_track)
-        Max_value=np.max(self.Gauss_full_track)
-        self.Max_index = np.where(self.Gauss_full_track == Max_value)
-        self.Max_index = self.Max_index[0]*10**-9+self.lim_min
-
-        self.Controle_track = self.MSDx_lag
-        self.Controle_track= np.vstack((self.Controle_track,self.covariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.trivariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.quadravariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.pentavariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.sixtvariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.septavariancex_lag))
-        self.Controle_track= np.vstack((self.Controle_track,self.octavariancex_lag))
-
-        self.Controle_track_variance = self.MSDx_lag_variance
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.covariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.trivariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.quadravariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.pentavariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.sixtvariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.septavariancex_lag_variance))
-        self.Controle_track_variance = np.vstack((self.Controle_track_variance, self.octavariancex_lag_variance))
-
-
-
-        self.Controle.append(np.mean(self.MSDx_lag))
-        self.Controle.append(np.mean(self.covariancex_lag))
-        self.Controle.append(np.mean(self.trivariancex_lag))
-        self.Controle.append(np.mean(self.quadravariancex_lag))
-        self.Controle.append(np.mean(self.pentavariancex_lag))
-        self.Controle.append(np.mean(self.sixtvariancex_lag))
-        self.Controle.append(np.mean(self.septavariancex_lag))
-        self.Controle.append(np.mean(self.octavariancex_lag))
-
-        self.Controle_variance.append(np.mean(self.MSDx_lag_variance))
-        self.Controle_variance.append(np.mean(self.covariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.trivariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.quadravariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.pentavariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.sixtvariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.septavariancex_lag_variance))
-        self.Controle_variance.append(np.mean(self.octavariancex_lag_variance))
-
-
-
-
-        # plt.plot(x,np.transpose(Gauss1))
-        # plt.show()
-
-
-        #self.fig_result_all_track = plt.Figure()
-        #ax1 = self.fig_result_all_track.add_subplot(221)
-        #ax1.plot(x, Gauss)
-        #ax1.set_title('Représentation des valeurs de rayon')
-
-
-        #TODO variance on D
-
-
-
-    def load_txt(self, filepath):
-
-        # TODO verifier que la position de l'export est toujours la même. Sinon, coder un truc
-        # On skip la premiere colone qui n'est pas un nombre.
-        raw = np.loadtxt(filepath, skiprows=1, usecols=np.arange(1, 19))
-
-        #Label ID TRACK_ID QUALITY POSITION_X POSITION_Y POSITION_Z POSITION_T FRAME RADIUS VISIBILITY MANUAL_COLOR MEAN_INTENSITY MEDIAN_INTENSITY MIN_INTENSITY MAX_INTENSITY TOTAL_INTENSITY STANDARD_DEVIATION ESTIMATED_DIAMETER CONTRAST SNR
-        nb_lines = np.shape(raw)[0]
-        #self.nTracks = int(raw[-1, 1])  #Track_ID
-
-        #self.tracks = [Track() for k in range(self.nTracks)]
-
-        unique, unique_index = np.unique(raw[:,1], return_index=True)
-        self.nTracks = np.size(unique)-1
-        self.tracks = [Track() for k in range(self.nTracks)]
-        i = 0
-        for i in range(self.nTracks):
-            data = raw[unique_index[i]:unique_index[i+1], :]
-            self.tracks[i].quality = data[:, 2]
-            self.tracks[i].x = data[:, 3]
-            self.tracks[i].y = data[:, 4]
-            self.tracks[i].z = data[:, 5]
-            self.tracks[i].t = data[:, 6]
-            self.tracks[i].diff_x = np.diff(self.tracks[i].x,1)
-            self.tracks[i].diff_y = np.diff(self.tracks[i].y,1)
-            # TODO le reste
-            self.tracks[i].nSpots = self.tracks[i].x.size
-            i += 1
-
-        # raw = np.transpose(raw)
-        # Chronological order :
-        # Serach for all lines taht shares the same time t
-        test = raw[:, 6]
-        unique, unique_index, unique_inverse, unique_counts = np.unique(raw[:, 6], return_index=True, return_inverse= True, return_counts=True)
-        self.nb_track_per_frame = unique_counts
-        self.id_of_track_at_time_t = None
-
-        #TODO multicore
-        self.analyze_all_tracks()
-
-    def analyze_all_tracks(self):
-        self.calculate_r_from_gauss()
-        self.covariance()
-
-
-    def calculate_displacement(self, pos, algo="None", step=1):
-        """
-        Return the list of all displacement Δx, defined as Δx = x[i+1] - x[i], while taking into account an eventual drift (cf algo)
-        :param algo: Algorithm for drift compensation.
-        "self" remove the mean of the data from all displacements
-        :return:
-        """
-        if algo == "None":
-            return np.diff(pos,step)
-        elif algo == "self":
-            return np.diff(pos,step) - np.mean(pos)
-        elif algo == "neighbors":
-            # TODO
-            return np.diff(pos), np.diff(pos)
-        elif algo == "covar":
-            return np.diff(pos,step+1)
-
-
-    def gaussian_delta_fit(self, pos, algo_drift_compensation="None"):
-        """
-        :param pos: Tableau contenant les positions au cours du temps.
-        :param algo_drift_compensation:
-        :return:
-        """
-        def gaussian(x, amp, cen, wid):
+        def find_track_id_index(filepath):
             """
-            Une gaussienne (non normalisée) est définie par :
-            exp(-1/2 (x-µ)²/σ²
-
-            où µ est la moyenne
-            et σ est l'écart type (standart deviation) avec donc σ² <=> Variance.
-            ici wid est égale à 2 σ²
-            :param x:
-            :param amp:
-            :param cen: µ
-            :param wid: 2 σ²
+            Sub funciton of "load_TrackData_txt" that returns the nb of columns and the position of two columns : TRACK_ID and POSITION_T
+            :param filepath:
             :return:
             """
-            return amp * np.exp(-(x - cen) ** 2 / wid)
+            # TODO chercher aussi les headers, x, y, diameter, etc...
+            with open(filepath, 'r') as file:
+                # Read the first line, which is the header
+                header_line = file.readline().strip()
 
-        diff = self.calculate_displacement(pos, algo_drift_compensation)
+            # Split the line by spaces to get column names
+            columns = header_line.split(" ")
 
-        # https://indico.cern.ch/event/428334/contributions/1047042/attachments/919069/1299634/ChoosingTheRightBinWidth.pdf
+            # Count the number of columns
+            num_columns = len(columns)
 
-        hist, boundaries = np.histogram(diff, bins="sturges")
-        boundaries = boundaries[0:-1]
-        gmodel = Model(gaussian, nan_policy='raise')
-        max_, min_ = np.max(hist), np.min(hist)
-        max_bound, min_bound = np.max(boundaries), np.min(boundaries)
-        params = gmodel.make_params(cen=np.mean(diff), amp=max_, wid=np.std(diff))
-        params["amp"].min = 0
-        params["amp"].max = 2 * max_
-        params["wid"].min = 0
-        params["cen"].min = min_bound
+            # Find the index of the "TRACK_ID" column
+            try:
+                track_id_index = columns.index("TRACK_ID")
+            except ValueError:
+                print("The 'TRACK_ID' column does not exist in the file.")
+                return None, None, None
 
-        params["cen"].max = max_bound
-        params["wid"].max = max_bound - min_bound
+            # Find the index of the "POSITION_T" column. T stands for time
+            try:
+                position_T_index = columns.index("POSITION_T")
+            except ValueError:
+                print("The 'POSITION_T' column does not exist in the file.")
+                return None, None, None
 
-        try :
-            result = gmodel.fit(hist, params, x=boundaries)
-        except ValueError:
-            return None, None, None, None, None, None
+            return num_columns, track_id_index, position_T_index
 
-        return diff, hist, boundaries, result, result.params["cen"], result.params["wid"]
+        num_columns, track_id_index, position_T_index = find_track_id_index(filepath)
+        if num_columns is None:
+            print("Error during the track data loading : no header in the text file")
+            return None
+
+        # Load file to numpy array
+        # We skip the first line which is the text header (skiprows=1)
+        # We don't take in account the first column (LABEL_ID) which contains text and that is redundant with ID.
+        # Typical Header :
+        # Label    ID       TRACK_ID QUALITY POSITION_X POSITION_Y POSITION_Z POSITION_T FRAME RADIUS VISIBILITY MANUAL_COLOR MEAN_INTENSITY MEDIAN_INTENSITY MIN_INTENSITY MAX_INTENSITY TOTAL_INTENSITY STANDARD_DEVIATION ESTIMATED_DIAMETER CONTRAST SNR
+        # ID10975  10975	0	     2.451	 317.287	192.140	0  0	0	5	1	-10921639	27.660	26	8	58	2683	10.804	5.096	0.279	1.116
+        raw = np.loadtxt(filepath, skiprows=1, usecols=np.arange(1, num_columns-1))
+
+        # Since we don't take in account Label, we need to update the Track_ID position
+        track_id_index -= 1
+        position_T_index -= 1
+
+        nb_lines = np.shape(raw)[0]
+        # print(nb_lines)
+
+        # Tracks are listed by ascending trackID and then chronologicaly (MOST of the time, in some txt files, the track where misteriously mixed...)
+
+        # We search for the positions in the raw numpy array of each unique track based on their Track_ID
+        unique, unique_index = np.unique(raw[:, track_id_index], return_index=True)
+        self.nTracks = np.size(unique) - 1  #FIXME why -1 ?
+
+        # Split the raw data into a list of sub-arrays, one per unique track
+        data_splits_per_track = [raw[unique_index[i]:unique_index[i + 1], :] for i in range(self.nTracks)]
+
+        # Global variable for multiprocessor management
+        global tasks_completed
+        tasks_completed = 0
+
+        # Preparing params for multiprocessor calculation of each tracks
+        #TODO transfer the nb of the columns
+        #FIXME eta(T)
+        params = {
+            "T": self.T,
+            "eta": self.eta,
+            "timeUnits": self.frame_rate,   # TODO rename it frame_rate instead of timeUnits which is ambigouys
+            "space_units_nm": self.space_units_nm,
+            "R": self.R,    # what is R ?
+            "algo_drift_compensation": self.algo_drift,
+            "min_nb_spot_for_gaussian_fit": self.min_nb_spot_for_gaussian_fit,
+            "min_nb_spot_for_covariance": self.min_nb_spot_for_covariance
+        }
 
 
-    def trackmate_peak_import(self, trackmate_xml_path, get_tracks=False):
+
+        # Create a ProcessPoolExecutor and populate the Track objects in parallel
+        num_cores = os.cpu_count()
+
+        self.current_task = "Processing tracks"
+
+        #FIXME j'ai cassé le multiproc !
+        # with ProcessPoolExecutor(max_workers=int(num_cores*0.75)) as executor:
+        #     self.tracks = list(executor.map(init_track, data_splits, repeat(params)))
+
+        self.tracks = list(map(init_track, data_splits_per_track, repeat(params)))
+
+        # Filter tracks with not enough spots for reliable tracking analysis
+        self.tracks = [track for track in self.tracks if track.nSpots >= self.min_nb_spot_for_covariance]
+        self.nTracks = len(self.tracks)
+
+        self.current_task = "Arranging tracks in frame structure"
+
+        #for data in data_splits:
+        #    self.tracks.append(init_track(data, params))
+
+        # Create the Frame structure where data are not organized as tracks but as frame
+        # Since the data is already organized by track, we don't go back to raw data that we would organize by time
+        # but we capitalize on the already existing track organization
+
+        # Combien y a til de frames ? Autant qu'il y a d'image dans le fichier. Si je n'ai pas le film, je peux me baser sur l'index t max dans les tracks.
+
+
+
+        max_t = -1
+        for track in self.tracks:
+            t_max_track = max(track.t)
+            if t_max_track > max_t:
+                max_t = t_max_track
+        nb_frame = int(max_t)
+        self.frames = [Frame() for i in range(nb_frame + 1)]
+
+        for frame in self.frames:
+            frame.spots = []
+        for track in self.tracks:
+            for i in range(track.nSpots):
+                spot = Spot()
+                spot.parent_track = track
+                spot.id = track.spot_ids[i]
+                spot.x = track.x[i]
+                spot.y = track.y[i]
+
+                num_frame = int(track.t[i])
+                if num_frame >= nb_frame + 1:
+                    dummy = 1
+                self.frames[num_frame].spots.append(spot)
+
+        self.get_stats()
+
+        self.current_task = "idle"
+
+
+    def get_histogramm(self, type="standart", params=None):
+        if type == "standart":
+            method = params["method"]
+            radius_list =[]
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if method == "Covariance":
+                        radius_list.append(track.r_cov)
+                    elif method == "GaussianFit":
+                        radius_list.append(track.r_gauss)
+                    elif method == "MSD":
+                        radius_list.append(track.r_msd)
+
+            self.y_histo, self.x_histo = np.histogram(radius_list)
+            return self.x_histo, self.y_histo
+
+        elif type == "gauss":
+            # We add a NORMALIZED gaussian for each track. This gaussian is centered
+            """
+            \frac{1}{\sigma \sqrt{2\,\pi}}\, \mathrm{e}^{-\frac{\left(x-\mu\right)^2}{2\sigma^2}}
+            where sigma is the standart deviation wheras error_r_cov is the variance
+            """
+            nb_pt_in_histo = 2000   #FIXME ? Hardcoded
+            r_min_nm = params["r_min_nm"]
+            r_max_nm = params["r_max_nm"]
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo)
+            self.y_histo = np.zeros(nb_pt_in_histo)
+            for track in self.tracks:
+                if not track.is_filtered:
+                    #FIXME track.error_r_cov <-> Variance
+                    #FIXME l'erreur de la covariance est bien trop petite.
+                    variance = track.error_r_cov
+                    r = track.r_cov
+                    gaussian = 1 / ( np.sqrt(2 * np.pi * variance)) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance))
+                    gaussian *= 1E9 # to nm
+                    self.y_histo += gaussian
+            return self.x_histo, self.y_histo
+
+        elif type == "MLE":
+            """
+            Based on Improved nano-particle tracking analysis John G WalkerMeas. Sci. Technol. 23 (2012) 065605 doi:10.1088/0957-0233/23/6/065605
+            """
+            return self.get_histogram_MLE(params)
+
+
+
+    def get_histogram_MLE(self, params):
         """
-        From pyTrackmate
+        Draw an histogramm of the measured radius of the particle weighting each track with its number of spot.
+        More precisely, we use an Minium LogLikelyHood estimation.
+        Based on Walker, J.G., 2012. Improved nano-particle tracking analysis. Measurement Science and Technology, 23(6), p.065605.
 
-        Import detected peaks with TrackMate Fiji plugin.
+        :return:
+        """
+        bin_size_nm = 2 # NB : hardcoded
+        delta_R = bin_size_nm * 1E-9 # SI -> m
 
-        Parameters
-        ----------
-        trackmate_xml_path : str
-            TrackMate XML file path.
-        get_tracks : boolean
-            Add tracks to label
+        # self.T, self.eta, self.timeUnits
+
+
+
+        # Avoir les données brutes
+        # nanotrackJ retourne le coefficient de diffusiond comme (D1 + D2) /2, mesurer sur les axes x et y.
+        # Puis avant d'envoyer vers l'algorithme de Walker, on a :
+        # 		double pixelSquared_to_E10x_cmSquared=nmPerPixel*nmPerPixel*Math.pow(10,-4);
+        # 		dc = diffCoeffEst.getDiffusionCoefficient(this, driftx, drifty) * pixelSquared_to_E10x_cmSquared;
+        # double msd = d * 4.0 / framerate; // Diffusionkoeffizient zurückrechnen
+
+        # Trouver les min et max en MSD et nbSpots.
+
+        MSDs = [] # List of diffusion coefficient (averaged on x and y).
+        ks = [] # List of nb of spot in the track
+        rs = []
+        # conv_fact = 1E-10
+        for track in self.tracks:
+            if track.is_filtered:
+                continue
+            if track.Dx_cov == -1 or track.Dy_cov == -1:
+                continue
+            D = (track.Dx_cov + track.Dy_cov)/2  # * conv_fact -> SI m²/s
+            MSD = D * 4 / self.frame_rate # SI m²
+            MSDs.append(MSD)
+            ks.append(track.nSpots)
+            r = self.radius_nm_from_coeff_diff(D)
+            rs.append(r)
+
+        k_max = max(ks)
+        k_min = min(ks)
+        MSD_max = max(MSDs)
+        r_max_nm = max(rs)
+
+        # LUT for log calculation
+        logMapK = np.full(k_max + 1, np.nan)  # Cache pour log(k)
+        logMapGammaK = np.full(k_max + 1, np.nan)  # Cache pour log(gamma(k))
+
+
+
+        r_max_nm_user = params["r_max_nm"]
+        r_max_nm_user = 150 #FIXME
+        if r_max_nm_user != 0:
+            r_max_nm = r_max_nm_user
+
+        bin_num = int(r_max_nm / bin_size_nm)
+
+        #TODO, calculer les LUT dès maintenant et pas au fur et à mesure
+        theta_LUT = np.zeros(bin_num)
+        log_theta_LUT = np.zeros(bin_num)
+        log_k_LUT = np.zeros(k_max + 1)
+        logMapGammaK = np.zeros(k_max + 1)
+
+        hist_bin_number = int (np.sqrt(len(MSDs))) # "square root rule" for the number of MSD bins (https://medium.com/@maxmarkovvision/optimal-number-of-bins-for-histograms-3d7c48086fde)
+        delta_B = MSD_max / hist_bin_number
+
+        histogram_MSD = np.zeros(hist_bin_number)
+        Nk = np.zeros(k_max + 1)
+
+        # Préparartion des histogrammes Nk -> combien il y a de track avec k et histogram_MSD ->
+        for i in range(len(MSDs)):
+            Nk[ks[i]] += 1
+            idx = int(MSDs[i] / delta_B - 0.001) # 0.001 ?
+            histogram_MSD[idx] += 1
+
+        def probMSD(msd, k, r):
+            """
+            On calcul le log pour ensuite prendre l'exponentielle pour des questions de nombre très grands...
+            """
+            #                           k_n (k_n \Delta_n)^{k_n - 1} exp(-k_n \Delta_n / \theta_r)
+            # P_d(\Delta_n; k_n, r) = --------------------------------------------------------------
+            #                              \theta_r^{k_n} + \Gamma(k_n)
+
+            # p_msd = (log(k) + (k-1) * (log(k) + log(msd)) - k * msd / theta) - (k * log(theta) + log(gamma(k)))
+            # theta_r = 2 K R \deltat / (3 * pi * eat * t + 2 simga_e^2
+
+            # TODO LUT de theta et log theta
+            theta = (2 * self.kb * self.T / self.frame_rate) / (3 * np.pi * self.eta * r)
+
+            # pmsd = k * np.power((msd * k), k-1) * np.exp(- k * msd / theta) / (np.power(theta, k) * gamma(k))
+
+            log_pmsd = (np.log(k) + (k - 1) * (np.log(k) + np.log(msd)) - (k * msd / theta)) - (k * np.log(theta) + gammaln(k))
+            #TODO lut de msd
+            # log_pmsd = (logK(k) + (k - 1) * (logK(k) + np.log(msd)) - (k * msd / theta)) - (k * np.log(theta) + logGammaK(k))
+
+            pmsd_via_log = np.exp(log_pmsd)
+            return pmsd_via_log
+
+        def logK(k):
+            """
+            Using a LUT for log calculation
+            """
+            if not np.isnan(logMapK[int(k)]):
+                return logMapK[int(k)]
+            logMapK[int(k)] = np.log(k)
+            return logMapK[int(k)]
+
+        def logGammaK(k):
+            """
+            Using a LUT for log calculation
+            """
+            if not np.isnan(logMapGammaK[int(k)]):
+                return logMapGammaK[int(k)]
+            logMapGammaK[int(k)] = gammaln(k)
+            return logMapGammaK[int(k)]
+
+        # Le temps de calcul est trop long, et j'ai l'impression que l'on recalcule sans cesse la même chose. On va donc faire une LUT
+        # En entrée, le numéro de la bin d'histogramme de la MSD, k le nombre de spot dans la track et le numero de bin de l'histogramme en r
+        prob_MSD_LUT = np.zeros((len(MSDs), k_max, bin_num))
+
+        # Non ! Ma LUT est trop débile. ce n'est pas la peine de calculer tous les couples Delta_n, k_n mais seul ceux qui sont présents expéiremntalement
+        # La table n'est que 2D, première dimension le numéro de la track n  et ensuite le rayon de la densité de proba.
+        nb_track = len(MSDs)
+        prob_MSD_LUT = np.zeros((nb_track, bin_num))
+        # # TODO paralellize, vectorize ?
+        for n in range(nb_track):
+            for r_idx in range(bin_num):
+                prob_MSD_LUT[n, r_idx] = probMSD(MSDs[n], ks[n], (r_idx + 1) * delta_R)
+
+        plt.plot(prob_MSD_LUT[10, :])
+        plt.show()
+
+        # Il faut aussi une LUT différente pour lorsque l'on reconstruit l'histogramme des MSD
+        prob_hist_MSD_LUT = np.zeros((hist_bin_number, k_max - k_min + 1, bin_num))
+        for b in range(hist_bin_number):
+            for k in range(k_min, k_max + 1):
+                for r_idx in range(bin_num):
+                    prob_hist_MSD_LUT[b, k-k_min, r_idx] = probMSD((b + 1) * delta_B, k, (r_idx + 1) * delta_R)
+
+
+        plt.plot(prob_hist_MSD_LUT[:, 50, 20])
+        plt.show()
+
+        # La densité de probabilité en rayon P_r, ce que l'on cherche est discrétisée en M points indéxé par m, avec r_m = m \Delta r (delta_R ici)
+
+        # LUT for theta avec le rayon r qui prend toujours les mêmes valeurs discretes :  (r_idx + 1) * delta_R
+        for r_idx in range(bin_num):
+            log_theta_LUT[r_idx] = (2 * self.kb * self.T / self.frame_rate) / (3 * np.pi * self.eta * (r_idx + 1) * delta_R)
+
+
+        # # TODO paralellize, vectorize ?
+        # for msd_idx in range(len(MSDs)):
+        #     for k in range(1, k_max): # pas zero car on va calculer le log. En soit, c'est inutile de calculer avant k > 10 ...
+        #         for r_idx in range(bin_num):
+        #             prob_MSD_LUT[msd_idx, k, r_idx] = probMSD(MSDs[msd_idx], k, (r_idx + 1) * delta_R)
+
+
+        def getHistogramML(pm):
+            """
+            TODO vectorize ?
+            :param pm:
+            :return:
+            """
+            histMl = np.zeros(hist_bin_number)
+            sumpm = np.sum(pm)
+            for b in range(hist_bin_number):
+                outersum = 0
+                for k in range(k_min, k_max + 1):
+                    innersum = 0
+                    for m in range(len(pm)):
+                        # probMSD(msd, k, r)
+                        # Σ_{m = 1}^M P_d(\Delta_n ; k_n, r_n) P_m / (Σ_{m = 1}^M P_m)
+                        # innersum += (probMSD((b + 1) * delta_B, k, (m + 1) * delta_R) * delta_B * pm[m]) / sumpm
+                        innersum += prob_hist_MSD_LUT[b, k-k_min, m] * delta_B * pm[m] / sumpm
+                    # 1/N * Σ_[n=1}^N
+                    outersum += Nk[k] * innersum
+                histMl[b] = outersum
+            return histMl
+
+        def getChiSquared(pm):
+            sumchi = 0
+            histML = getHistogramML(pm)
+            # for b in range(hist_bin_number):
+            #     diff = histogram_MSD - histML[b]
+            #     sumchi += diff**2 / histML[b]
+            diff = histogram_MSD - histML
+            sumchi = np.sum((diff ** 2) / histML)
+            return sumchi
+
+        # initialisation de la densité de proba -> uniforme
+        # dens = np.full(hist_bin_number, 1.0 / hist_bin_number)
+        dens = np.full(bin_num, 1.0 / bin_num)
+        lastChiSquared = getChiSquared(dens)
+        changeChiSquared = np.inf
+
+        # Ici, il faut que j'utilise les MSD des datas Delta et les nombres de spot k
+        # Par contre quelle MSD prendre, j'ai celle en x et en y, la moyenne des deux ? Il faut regarder dans le code de nanotrackj
+        # Je remonte le code nanotrackJ_.java
+
+        # Je trouve que c'est msd = (Dx + Dy)/2 * nmPerPixel * nmPerPixel * 1E-4 * 4 / Framerate
+        # Ce qui est raccord avec une diffusion 2D où MSD = 4 * D * Delta t
+
+        """
+        double d = tracks.get(i).getDiffusionCoefficient(doCorrectDrift, useKalman);
+         double msd = d*4.0/framerate; //Diffusionkoeffizient zurückrechnen
+        data.add(msd);
+        data.add((double)tracks.get(i).size());
+        WalkerMethodEstimator walker = new WalkerMethodEstimator(dataarray, temp, visk, framerate,maxWalkerHistogrammDiameter);
+
+        Puis dans track.j
+            private double getDiffusionCoefficient(double driftx, double drifty){
+            double pixelSquared_to_E10x_cmSquared=nmPerPixel*nmPerPixel*Math.pow(10,-4);
+            dc = diffCoeffEst.getDiffusionCoefficient(this, driftx, drifty) * pixelSquared_to_E10x_cmSquared;
+            return dc;
+        }
+
+        puis :
+
+            @Override	
+            /**
+             * Calculates the Diffusion Coefficient as described in:
+             * Vestergaard, C., 2012. 
+             * Optimal Estimation of Diffusion Coefficients from Noisy Time-Lapse-Recorded Single-Particle Trajectories. 
+             * Technical University of Denmark.
+             */
+            public double getDiffusionCoefficient(Track track, double driftX,
+                    double driftY) {
+                this.driftx = driftX;
+                this.drifty = driftY;
+                this.track = track;
+
+                if(track.size()==1){
+                    return 0;
+                }
+                double[] covData = getCovData(track, 0, driftX, driftY);
+
+                return covData[0];
+            }
+
+        double D1 = termXA+termXB;	
+        double D2 = termYA+termYB;
+        double D = (D1+D2)/2;
+
+        puis de covariance estimator :
+                double[] data  = new double[3]; //[0] = Diffusioncoefficient, [1] = LocNoiseX, [2] = LocNoiseY
+        data[0] = D;
+        data[1] = R*msdX + (2*R-1)+covX;
+        data[2] = R*msdY + (2*R-1)+covY;
+        return data;
         """
 
-        root = et.fromstring(open(trackmate_xml_path).read())
 
-        objects = []
-        object_labels = {'FRAME': 't_stamp',
-                         'POSITION_T': 't',
-                         'POSITION_X': 'x',
-                         'POSITION_Y': 'y',
-                         'POSITION_Z': 'z',
-                         'MEAN_INTENSITY': 'I',
-                         'ESTIMATED_DIAMETER': 'w',
-                         'QUALITY': 'q',
-                         'ID': 'spot_id',
-                         'MEAN_INTENSITY': 'mean_intensity',
-                         'MEDIAN_INTENSITY': 'median_intensity',
-                         'MIN_INTENSITY': 'min_intensity',
-                         'MAX_INTENSITY': 'max_intensity',
-                         'TOTAL_INTENSITY': 'total_intensity',
-                         'STANDARD_DEVIATION': 'std_intensity',
-                         'CONTRAST': 'contrast',
-                         'SNR': 'snr'}
+        while changeChiSquared > 0.01:
+            for m in range(len(dens)):
+                sumpm = np.sum(dens)
+                sum_over_n = 0
+                nb_track = len(MSDs)
+                for n in range(nb_track):
+                    denominator = 0
+                    # probMSD(msd, k, r)
+                    # numerator = probMSD(MSDs[n], ks[n], (m + 1) * delta_R)   # numérateur
+                    numerator = prob_MSD_LUT[n, m]  # numérateur
 
-        features = root.find('Model').find('FeatureDeclarations').find('SpotFeatures')
-        features = [c.get('feature') for c in list(features)] + ['ID']
+                    # dénominateur
+                    for l in range(len(dens)):
+                        # prob = probMSD(MSDs[n], ks[n], (l + 1) * delta_R)
+                        prob = prob_MSD_LUT[n, l]
+                        denominator += prob * dens[l] / sumpm
+                    sum_over_n += numerator / denominator
+                dens[m] *= 1.0 / nb_track * sum_over_n
 
-        spots = root.find('Model').find('AllSpots')
-        trajs = pd.DataFrame([])
-        objects = []
-        for frame in spots.findall('SpotsInFrame'):
-            for spot in frame.findall('Spot'):
-                single_object = []
-                for label in features:
-                    single_object.append(spot.get(label))
-                objects.append(single_object)
-
-        trajs = pd.DataFrame(objects, columns=features)
-        trajs = trajs.astype(np.float)
-
-        # Apply initial filtering
-        initial_filter = root.find("Settings").find("InitialSpotFilter")
-
-        trajs = self.filter_spots(trajs,
-                             name=initial_filter.get('feature'),
-                             value=float(initial_filter.get('value')),
-                             isabove=True if initial_filter.get('isabove') == 'true' else False)
-
-        # Apply filters
-        spot_filters = root.find("Settings").find("SpotFilterCollection")
-
-        for spot_filter in spot_filters.findall('Filter'):
-
-            trajs = self.filter_spots(trajs,
-                                 name=spot_filter.get('feature'),
-                                 value=float(spot_filter.get('value')),
-                                 isabove=True if spot_filter.get('isabove') == 'true' else False)
-
-        trajs = trajs.loc[:, object_labels.keys()]
-        trajs.columns = [object_labels[k] for k in object_labels.keys()]
-        trajs['label'] = np.arange(trajs.shape[0])
-
-        # Get tracks
-        if get_tracks:
-            filtered_track_ids = [int(track.get('TRACK_ID')) for track in root.find('Model').find('FilteredTracks').findall('TrackID')]
-
-            label_id = 0
-            trajs['label'] = np.nan
-
-            tracks = root.find('Model').find('AllTracks')
-            for track in tracks.findall('Track'):
-
-                track_id = int(track.get("TRACK_ID"))
-                if track_id in filtered_track_ids:
-
-                    spot_ids = [(edge.get('SPOT_SOURCE_ID'), edge.get('SPOT_TARGET_ID'), edge.get('EDGE_TIME')) for edge in track.findall('Edge')]
-                    spot_ids = np.array(spot_ids).astype('float')[:, :2]
-                    spot_ids = set(spot_ids.flatten())
-
-                    trajs.loc[trajs["spot_id"].isin(spot_ids), "label"] = label_id
-                    label_id += 1
-
-            # Label remaining columns
-            single_track = trajs.loc[trajs["label"].isnull()]
-            trajs.loc[trajs["label"].isnull(), "label"] = label_id + np.arange(0, len(single_track))
+            newChiSquared = getChiSquared(dens)
+            changeChiSquared = abs(newChiSquared - lastChiSquared) / lastChiSquared
+            lastChiSquared = newChiSquared
 
 
-        print(trajs)
-        return trajs
+        # normalize density
+        dens /= np.sum(dens)
+        hist_x = np.zeros(len(dens))
+        for i in range(len(dens)):
+            hist_x[i] = bin_size_nm * (i + 1) * 2.0  # To Diameter in [nm]
 
+        return hist_x, dens
+
+    def get_stats(self):
+        # Calculate some statistics
+        mean_nspots, rcov, r_msd, r_gauss = [], [], [], []
+
+        for track in self.tracks:
+            if not track.is_filtered:
+                mean_nspots.append(track.nSpots)
+                rcov.append(track.r_cov)
+                r_msd.append(track.r_msd)
+                r_gauss.append(track.r_gauss)
+
+        self.mean_nspots = np.mean(mean_nspots)
+        self.mean_rcov = np.mean(rcov)
+        self.mean_r_msd = np.mean(r_msd)
+        self.mean_r_gauss = np.mean(r_gauss)
+        self.std_rcov = np.std(rcov)
+        self.std_r_msd = np.std(r_msd)
+        self.std_r_gauss = np.std(r_gauss)
+        self.median_rcov = np.median(rcov)
+        self.median_r_msd = np.median(r_msd)
+        self.median_r_gauss = np.median(r_gauss)
+
+    def measure_concentration(self):
+        """
+        Adapter les idées de Marius à ce sujet.
+        """
+        pass
+
+    def load_VideoData(self, params):
+        """
+        :param params:
+        :return:
+        """
+        filmpath = params["filepath_video"]
+        self.current_task = "Loading video in RAM"
+
+        with tifffile.TiffFile(filmpath) as tif:
+            #TODO gerer les erreurs d'ouverture du fichier
+            # Extract frames from pages and convert to NumPy array
+            self.video_array = np.stack([page.asarray() for page in tif.pages], axis=-1)
+
+
+        # FIXME we should keep these information somewhere. Right ?
+        height, width, frames = self.video_array.shape[:3]
+
+        # Extract color channels
+        self.video_array_red = self.video_array[:, :, 0, :]
+        self.video_array_green = self.video_array[:, :, 1, :]
+        self.video_array_blue = self.video_array[:, :, 2, :]    #FIXME not tested
+
+        # Update the frames structure where spot are organized by time
+        # All we need to do is to update their raw image data
+        for video_frame_num in range(frames):
+            self.frames[video_frame_num].img = [self.video_array_red, self.video_array_green, self.video_array_blue]
+            
+
+
+        self.current_task = "Analize momomere"
+        self.Analyze_color()
+        self.get_ratio_color()
+
+        self.current_task = "Idle"
+
+        #if not film.isOpened():
+            #TODO Log
+        #    print("Error opening video.")
+        #    return
+
+
+    def calculate_draw_tracks(self,track_number):
+        """
+        TODO
+        :param track_number:
+        :return:
+        """
+        track_number = int(float(track_number))
+        if 1 < track_number < np.size(self.tracks,0) :
+            track = self.tracks[track_number - 1]
+            track_x = track.x
+            track_y = track.y
+
+        else :
+            print("track doesnt exist")
+        return track_x,track_y
+
+
+    def calculate_distance(self, frame_number, threshold):
+        """
+        :param frame_number:
+        :param threshold:
+        :return:
+        """
+        position = []
+        for track in self.tracks:
+            index = np.where(track.t == frame_number)[0]
+            if index.size > 0:
+                x = track.x[index[0]]
+                y = track.y[index[0]]
+                position.append((x, y))
+        for l in range(len(position)) :
+            for j in range(len(position)) :
+                if l != j :
+                    distance = np.sqrt((position[j][0]-position[l][0])**2 + (position[j][1]-position[l][1])**2)
+                    #print(distance)
+                    if distance < threshold :
+                        self.overlap += 1
+                        self.overlap_time.append(frame_number)
+
+
+    def calculate_box_position(self, frame_number):
+        """
+        TODO ?
+        :param frame_number:
+        :return:
+        """
+        position = []
+        tracker_color = []
+        if self.tracks != None :
+            for track in self.tracks :
+                index = np.where(track.t  == frame_number)[0]
+                if index.size > 0 :
+                    #if track.x[index] != None:
+                    x = track.x[index[0]]
+                    #if track.y[index] != None:
+                    y = track.y[index[0]]
+                    if self.video_array_red[int(y),int(x),frame_number] > self.video_array_green[int(y),int(x),frame_number] :
+                        tracker_red = 1
+                    else :
+                        tracker_red = 0
+
+                    tracker_color.append(tracker_red)
+                    position.append((x, y))
+            #print(position)
+
+
+        return position,tracker_color
+
+    def Analyze_color(self, params):
+        """
+        :return:
+        """
+
+        self.box_radius = params["Analyze_particle_box_size_in_pixel"]    # ? FIXME Hardcoded
+        self.red = 0
+        self.green = 0
+        self.compteur_red = 0
+        self.compteur_green = 0
+
+        for track in self.tracks:
+            # For each spot in one track, we calculate the value of the red and green canal around the particle in a size self.
+            track.spot_colors = []
+            track.spot_main_color = []
+            for m in range(np.size(track.x)):
+                #FIXME pourquoi -1 sur le compteur temps ?
+                Value_red = np.sum(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                Value_green = np.sum(self.video_array_green[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                Value_blue = np.sum(
+                    self.video_array_blue[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius,
+                    int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+
+                color = [Value_red, Value_green, Value_blue]
+                track.spot_colors.append(color)
+
+                track.spot_main_color.append(np.argmax(color))   # 0 for red, 1 for green, 2 for blue
+
+            # Attribute color to the track -> Among all spots, what color was the most present.
+            def most_frequent_value(lst):
+                values, counts = np.unique(lst, return_counts=True)
+                most_frequent_index = np.argmax(counts)
+                return values[most_frequent_index]
+            track.color = most_frequent_value(track.spot_main_color)
+
+    def get_ratio_color(self):
+        r, g, b = 0,0,0
+        for track in self.tracks:
+            if not track.is_filtered:
+                if track.color == 0:
+                    r += 1
+                elif track.color == 1:
+                    g += 1
+                elif track.color == 2:
+                    b += 1
+        total = r + g + b
+        self.ratio_red = r / total
+        self.ratio_green = g / total
+        self.ratio_blue = b / total
+
+
+
+    def exportData(self, filename):
+        data = (self.Moyenner)
+        np.savetxt(filename, data,newline='\n')
 
 
     def get_all_delta_in_chronological_order(self):
         pass
 
-    def compute_global_drift_speed(self, windows_length=None):
-        """
-        On a besoin d'un tableau ordonée en temps et non par particule.
-        :param windows_length:
-        :return:
-        """
-        pass
-
-    def compute_drift_from_centroid(self):
-        pass
-
-    def calculate_r_from_full_gauss(self, mode="all"):
-        """
-        Wa gather ALL the displacement (Δx ANF Δy) from ALL the particle into one single gaussian that is fitted
-        :param mode: "all" (default)-> combine x and y, "x" -> only x axis, "y" -> only y axis
-        :return:
-        """
-        list_delta = []
-        #FIXME better syntax
-        for track in self.tracks:
-            if mode == "all":
-                list_delta.append(np.diff(track.x))
-                list_delta.append(np.diff(track.y))
-            elif mode == "x":
-                list_delta.append(np.diff(track.x))
-            elif mode == "y":
-                list_delta.append(np.diff(track.y))
-
-        deltas = np.concatenate(list_delta)
-        diff, hist, boundaries, result, center, width = self.gaussian_delta_fit(deltas)
-        self.hist_full_gauss = hist
-        self.boundaries_full_gauss = hist
-        self.result_fit_full_gauss = result
-
-
-    def calculate_r_from_gauss(self):
-        """
-        Var (Δx) = <Δx²> - (<Δx>)²
-        <Δx²> est la MSD est on peut en déduire le coefficient de diffusion via  <Δx²> = 2 D Δt
-        (<Δx>)² est le carré de la moyenne, on peut en déduire une estimation, c'est le centre de la gaussienne.
-        Var (Δx) provient de l'ajustement de l'histogramme par une gaussienne.
-        :return:
-        """
-        kb_ = 1.38E-23
-        i = 0
-        for track in self.tracks:
-            # if i==963:
-            #     track.r_gauss = -1
-            #     dummy = 1
-            #     i += 1
-            #     continue
-            print(i)
-            i += 1
-            if track.isFiltered:
-                track.r_gauss = -1
-                continue
-            if track.nSpots < 10:
-                track.r_gauss = -1
-                continue
-
-            diff_x, hist_x, boundaries_x, result_x, center_x, width_x = self.gaussian_delta_fit(track.x, self.algo_drift)
-            # width <->  2 σ² where σ is the standart deviation and σ² the variance
-            # FIXME
-            if diff_x is None:
-                continue
-            mean_squared_SI = (center_x.value*self.space_units_nm*1E-9)**2
-            variance_SI = (width_x.value*self.space_units_nm*self.space_units_nm*1E-18) /2
-            # msd = width_x.value*2 + center_x.value**2
-            # TODO cehck the importance of the mean
-            # msd = variance_SI + mean_squared_SI
-            msd = variance_SI
-            track.Dx_gauss = msd/(2*self.timeUnits)
-            track.rx_gauss = kb_ * self.T / (6 * np.pi * self.eta * track.Dx_gauss)
-
-
-            diff_y, hist_y, boundaries_y, result_y, center_y, width_y = self.gaussian_delta_fit(track.y, self.algo_drift)
-            if diff_y is None:
-                continue
-            variance_SI = (width_y.value * self.space_units_nm * self.space_units_nm * 1E-18) / 2
-
-            mean_squared_SI = (center_y.value * self.space_units_nm * 1E-9) ** 2
-            # msd = variance_SI + mean_squared_SI
-            msd = variance_SI
-            track.Dy_gauss = msd/(2*self.timeUnits)
-            track.ry_gauss = kb_ * self.T / (6 * np.pi * self.eta * track.Dy_gauss)
-
-            #FIXME mean or np.sqrt(track.rx_gauss**2 + track.ry_gauss**2)/2
-            track.r_gauss = (track.rx_gauss + track.ry_gauss)/2
-            track.r_gauss = "{:e}".format(track.r_gauss)
-
-
-
-
-    def loadxmlTrajs(self, trackmate_xml_path):
-        """
-        Load xml files into a python dictionary with the following structure:
-            tracks = {'0': {'nSpots': 20, 'trackData': numpy.array(t, x, y, z) }}
-        Tracks should be xml file from 'Export tracks to XML file',
-        that contains only track info but not the features.
-        Similar to what 'importTrackMateTracks.m' needs.
-        """
-        # TODO multicore and loading bar in the GUI
-        try:
-            tree = et.parse(trackmate_xml_path);
-        except OSError:
-            print('Failed to read XML file {}.'.format(xlmfile))
-        root = tree.getroot()
-        # print(root.attrib)  # or extract metadata
-        self.nTracks = int(root.attrib['nTracks'])
-        self.frameInterval = float(root.attrib['frameInterval'])
-        self.space_units_nm = root.attrib['spaceUnits']
-        self.timeUnits = root.attrib['timeUnits']
-
-        # Working with numpy array -> TOO SLOW
-        # self.tracks = []
-        # for i in range(self.nTracks):
-        #     track = Track()
-        #     track.nSpots = int(root[i].attrib['nSpots'])
-        #     # FIXME more pythonic expression
-        #     track.t, track.x, track.y, track.z = np.zeros(track.nSpots), np.zeros(track.nSpots), np.zeros(track.nSpots), np.zeros(track.nSpots)
-        #     # self.tracks[trackIdx]['nSpots'] = nSpots
-        #     # trackData = np.array([]).reshape(0, 4)
-        #     for j in range(track.nSpots):
-        #         track.t[j] = float(root[i][j].attrib['t'])
-        #         track.x[j] = float(root[i][j].attrib['x'])
-        #         track.y[j] = float(root[i][j].attrib['y'])
-        #         track.z[j] = float(root[i][j].attrib['z'])
-
-
-        # self.tracks = [Track()]*self.nTracks
-        self.tracks = [Track() for k in range(self.nTracks)]
-        for i in range(self.nTracks):
-            trackIdx = str(i)
-            track = self.tracks[i]
-            track.t = np.zeros(track.nSpots)
-            track.x = np.zeros(track.nSpots)
-            track.y = np.zeros(track.nSpots)
-            track.z = np.zeros(track.nSpots)
-            # self.tracks_dict[trackIdx] = {}
-            nSpots = int(root[i].attrib['nSpots'])
-            # self.tracks_dict[trackIdx]['nSpots'] = nSpots
-            trackData = np.array([]).reshape(0, 4)
-            for j in range(nSpots):
-                t = float(root[i][j].attrib['t'])
-                x = float(root[i][j].attrib['x'])
-                y = float(root[i][j].attrib['y'])
-                z = float(root[i][j].attrib['z'])
-                spotData = np.array([t, x, y, z])
-                trackData = np.vstack((trackData, spotData))
-            # self.tracks_dict[trackIdx]['trackData'] = trackData
-
-            track.nSpots = nSpots
-            track.t = trackData[:, 0]
-            track.x = trackData[:, 1]
-            track.y = trackData[:, 2]
-            track.z = trackData[:, 3]
-
-
-
-        # Analyze track
-        # MonoCore implementation
-        i = 0
-        for track in self.tracks :
-            # print(i)
-            # track.gaussian_delta_fit()
-            # track.msd()
-            # track.covariance()
-            i += 1
-
-        # # Muti core implementation
-        # nb_of_workers = 4
-        # p = mp.Pool(nb_of_workers)
-        #
-        # def analyze_track(track_num):
-        #     print(track_num)
-        #     self.tracks[i].gaussian_delta_fit()
-        #     self.tracks[i].msd()
-        #     self.tracks[i].covariance()
-        #     return track_num
-        #
-        #
-        # results = [p.apply_async(analyze_track, args=(i, )) for i in range(self.nTracks)]
-        # # track.gaussian_delta_fit()
-        # # track.msd()
-        # # track.covariance()
-        # # print(result)
-        #
-        # # Gs = [p.get() for p in results]
-        # # print(Gs)
-        #
-        # Create statistics from  Track analyze :
-        # TODO
-        # Calculate Dx, Dy, rx, ry, etc
-
 
     def generate_brownian_track(self, params_dict):
-        #FIXME from params_dict
-        T = 293
-        eta = 1E-3
-        delta_t_ms = 30
-        nb_of_frame = 20000
-        particle_mean_diam_nm = 50
-        particle_diam_sigma_relative = 0
+
+        self.space_units_nm = params_dict["space_units_nm"]
+        self.T = params_dict["T"]
+        self.eta = params_dict["eta"]
+        self.frame_rate = 1 / params_dict["FrameRate"]
+
+        particle_1_mean_diam_nm = params_dict["d1_nm"]
+        particle_1_diam_sigma_relative = params_dict["sigma1_percent"]
+        nb_particle_1 = int(params_dict["nb_particle_1"])
+        particle_2_mean_diam_nm = params_dict["d2_nm"]
+        particle_2_diam_sigma_relative = params_dict["sigma2_percent"]
+        nb_particle_2 = int(params_dict["nb_particle_2"])
+
+        nb_spot_per_track = int(params_dict["nb_spot_per_track"])
+
+
+        #FIXME PARAMS ?
         dim_box_X_micron = 3000
         dim_box_Y_micron = 3000
         dim_box_Z_micron = 50
-        nb_particle = 100
-        depth_of_focus_micron = 100
+
+        #depth_of_focus_micron = 100
         drift_X_microns_per_frame = 0
         drift_Y_microns_per_frame = 0
 
-        self.space_units_nm = 263   # in nm
-        self.timeUnits = delta_t_ms/1000   # in s
-        self.T = T
-        self.eta = eta
-
+        #FIXME explain
+        #loc_values = np.random.choice([particle_1_mean_diam_nm, particle_2_mean_diam_nm], size=nb_particle,p=[ratio_monomere/100,(100-ratio_monomere)/100])
 
         kb = 1.380649E-23
 
-        particle_radiuss = np.random.normal(loc=particle_mean_diam_nm/2, scale=particle_mean_diam_nm/2*particle_diam_sigma_relative, size=nb_particle)
-        mean_diff_coeff = kb * T / (6*np.pi*eta*(particle_mean_diam_nm/2*1E-9))
-        diff_coeffs = kb * T / (6*np.pi*eta*(particle_radiuss*1E-9))
+        r1 = particle_1_mean_diam_nm/2
+        sigma_1 = r1 * particle_1_diam_sigma_relative/100
+        particle_radiuss_1 = np.random.normal(loc=r1, scale=sigma_1, size=nb_particle_1)
+
+        r2 = particle_2_mean_diam_nm / 2
+        sigma_2 = r1 * particle_2_diam_sigma_relative/100
+        particle_radiuss_2 = np.random.normal(loc=r2, scale=sigma_2, size=nb_particle_2)
+
+        particle_radiuss = np.concatenate((particle_radiuss_1, particle_radiuss_2))
+        nb_particle = nb_particle_1 + nb_particle_2
+
+        #mean_diff_coeff = kb * T / (6*np.pi*eta*(particle_1_mean_diam_nm/2*1E-9))
+        diff_coeffs = kb * self.T / (6 * np.pi * self.eta * (particle_radiuss*1E-9))
 
         # brownian_length = np.sqrt(2*mean_diff_coeff*delta_t_ms*1E-3)
         # mean_nb_spot_pert_track  = 0
         # mean_dwell_time_in_focus_s = (depth_of_focus_micron*1E-9)**2/(2*mean_diff_coeff)
 
-        npParticleType = np.dtype(
-            [('x', np.float), ('y', np.float), ('z', np.float), ('Dtx', np.float), ('Dty', np.float),
-             ('Dtz', np.float)])
+        npParticleType = np.dtype([('x', np.float64), ('y', np.float64), ('z', np.float64), ('Dtx', np.float64), ('Dty', np.float64),
+             ('Dtz', np.float64)])
         particles = np.zeros(nb_particle, dtype=npParticleType)
 
-
+        # Same diffusion coefficient for all direction : the particle are isotropic
         particles[:]['Dtx'] = particles[:]['Dtz'] = particles[:]['Dty'] = diff_coeffs
 
         # Initial position -> offset to all position
@@ -906,10 +1321,8 @@ class AnalyzeTrackCore():
         particles[:]['z'] = r[:, 2] * 2*dim_box_Z_micron - dim_box_Z_micron # centered on z = 0 i.e. the focal plane
 
         #Brownian motion
-
-
         # Draw random samples from a normal (Gaussian) distribution.
-        dr = np.random.normal(loc=0, scale=1.0, size=(nb_of_frame, nb_particle, 3))
+        dr = np.random.normal(loc=0, scale=1.0, size=(nb_spot_per_track, nb_particle, 3))
 
         # Constant drift
         dr[:, :, 0] += drift_X_microns_per_frame
@@ -919,41 +1332,46 @@ class AnalyzeTrackCore():
         dr = np.cumsum(dr, axis=0, out=dr)
 
         # TODO do not create a new array at each iteration
-        mvt_evolution = np.zeros((nb_of_frame, nb_particle), dtype=npParticleType)
+        mvt_evolution = np.zeros((nb_spot_per_track, nb_particle), dtype=npParticleType)
 
         # offsetting at t=0 by the initial position
         mvt_evolution[:] = particles
 
-        # Scaling the displacement with the diffusion coefficient
-        mvt_evolution[:]['x'] += dr[:, :, 0] * np.sqrt(2 * particles[:]['Dtx'] * self.timeUnits) * 1E6
-        mvt_evolution[:]['y'] += dr[:, :, 1] * np.sqrt(2 * particles[:]['Dty'] * self.timeUnits) * 1E6
-        mvt_evolution[:]['z'] += dr[:, :, 2] * np.sqrt(2 * particles[:]['Dtz'] * self.timeUnits) * 1E6
+        # Scaling the displacement with the diffusion coefficient -> in µm
+        mvt_evolution[:]['x'] += dr[:, :, 0] * np.sqrt(2 * particles[:]['Dtx'] * self.frame_rate) * 1E6
+        mvt_evolution[:]['y'] += dr[:, :, 1] * np.sqrt(2 * particles[:]['Dty'] * self.frame_rate) * 1E6
+        mvt_evolution[:]['z'] += 0 #dr[:, :, 2] * np.sqrt(2 * particles[:]['Dtz'] * self.timeUnits) * 1E6
 
-        # Extract track from brownian trajectory
+        # Create track from brownian trajectory
         self.tracks = []
-
-        # Une track est un ensemble de spot dont la position est comprise entre :
-        # x ∈ [0, dimX] and y ∈ [0, dimY] and z ∈ [-dof, +dof] where dof : depth of focus
-        # Les deux premieres conditions sont toujours vérifiées si on applique des conditions aux limites périodiques
-
-        def consecutive(data, stepsize=1):
-            # return np.split(data, np.where(np.diff(data) != stepsize)[0] + 1)
-            idx = np.r_[0, np.where(np.diff(data) != stepsize)[0] + 1, len(data)]
-            return [data[i:j] for i, j in zip(idx, idx[1:])]
-
 
 
         xs = mvt_evolution[:]['x']
         ys = mvt_evolution[:]['y']
         zs = mvt_evolution[:]['z']
-        dof = depth_of_focus_micron
+        #dof = depth_of_focus_micron
+        pos_micrometer_to_pixel = 1 / (self.space_units_nm / 1000)
         for i in range(nb_particle):
+            track = Track()
+            track.x = xs[:, i] * pos_micrometer_to_pixel
+            track.y = ys[:, i] * pos_micrometer_to_pixel
+            track.z = zs[:, i] * pos_micrometer_to_pixel
+            track.quality = 1
+            track.nSpots = track.x.size
+            self.tracks.append(track)
+
+            """
+            # pour gerer un eventuel defocus
+            def consecutive(data, stepsize=1):
+                # return np.split(data, np.where(np.diff(data) != stepsize)[0] + 1)
+                idx = np.r_[0, np.where(np.diff(data) != stepsize)[0] + 1, len(data)]
+                return [data[i:j] for i, j in zip(idx, idx[1:])]            
             z = zs[:, i]
-            idx_in_focus = np.where(np.logical_and(z < dof, z > -dof))
+            #idx_in_focus = np.where(np.logical_and(z < dof, z > -dof))
             if len(idx_in_focus[0]) > 1:  # Test if the list is not empty
                 tracks_idx = consecutive(idx_in_focus)
                 # FIXME there is a problem with the "consecutive" function that return empty array
-                pos_micro_to_pixel = 1/(self.space_units_nm/1000)
+                
                 for j in range(len(tracks_idx)):
                     if len(tracks_idx[j]) > 0:
                         # Create new track
@@ -964,10 +1382,30 @@ class AnalyzeTrackCore():
                         track.t = tracks_idx[j][0]
                         track.quality = 1
                         track.nSpots = track.x.size
-
                         self.tracks.append(track)
+            """
+
         self.nTracks = len(self.tracks)
-        self.analyze_all_tracks()
+
+        params = {
+            "T": self.T,
+            "eta": self.eta,
+            "timeUnits": self.frame_rate,
+            "space_units_nm": self.space_units_nm,
+            "R": self.R,
+            "algo_drift_compensation": self.algo_drift,
+            "min_nb_spot_for_gaussian_fit": self.min_nb_spot_for_gaussian_fit,
+            "min_nb_spot_for_covariance": self.min_nb_spot_for_covariance
+        }
+
+        #FIXME : multiprocessing
+        for track in self.tracks:
+            track.calculate_D_from_gauss(params)
+            track.calculate_D_from_MSD(params)
+            track.calculate_D_from_covariance(params)
+
+        self.get_stats()
+
 
     def filter_tracks(self, low1, high1, type1, not1, bool_op, low2, high2, type2, not2):
         #FIXME inclusive frontiere ?
@@ -975,17 +1413,37 @@ class AnalyzeTrackCore():
             filter_OK = False
 
             val = None
-            if type == "nb spots":
+            if type == "nSpots":
                 val = track.nSpots
-            # FIXME
-            elif type == "r nm":
-                val = track.r_nm
-            elif type == "CPS":
-                val = track.CPS
-            if val is not None:
-                if val < low or val > high:
+            elif type == "r_gauss":
+                val = track.r_gauss*1E9
+            elif type == "r_msd":
+                val = track.r_msd*1E9
+            elif type == "r_cov":
+                val = track.r_cov*1E9
+            elif type == "red_mean":
+                val = track.red_mean
+            elif type == "green_mean":
+                val = track.red_mean
+
+            if val is None:
+                return False
+
+            if low is None:
+                if high is None:
+                    return False
+                elif val > high:
                     filter_OK = True
+            else:
+                if high is None:
+                    if val < low:
+                        filter_OK = True
+                else:
+                    if val < low or val > high:
+                        filter_OK = True
+
             return filter_OK
+
 
         for track in self.tracks:
             filter1_OK = is_to_be_filtered(track, type1, low1, high1)
@@ -1009,9 +1467,134 @@ class AnalyzeTrackCore():
             else:
                 track.is_filtered = False
 
+    def get_correlation_graph(self, data_1_type, data_2_type):
+        x_axis = []
+        y_axis = []
+        def get_data_from_type(track, type):
+            if type == "nSpots":
+                return track.nSpots
+            elif type == "r_gauss":
+                return track.r_gauss
+            elif type == "r_msd":
+                return track.r_msd
+            elif type == "r_cov":
+                return track.r_cov
+            elif type == "red":
+                return track.colors[0]
+            elif type == "green":
+                return track.colors[1]
+            elif type == "blue":
+                return track.colors[2]
+
+        if data_1_type == data_2_type:
+            data_histo = []
+            for track in self.tracks:
+                continue
+                data_histo.append(get_data_from_type(track, data_1_type))
 
 
+            # We have to create an histogramm
+            hist, bin_edges = np.histogram(data_histo)
+            return hist, bin_edges
 
+        for track in self.tracks:
+            if track.is_filtered:
+                continue
+            x_axis.append(get_data_from_type(track, data_1_type))
+            y_axis.append(get_data_from_type(track, data_2_type))
+
+        return x_axis, y_axis
+
+    def clear_filter(self):
+        for track in self.tracks:
+            track.is_filtered = False
+        pass
+
+    def get_full_MSD(self):
+        msd = []
+        for track in self.tracks:
+            if track.is_filtered is not True:
+                msd.append(track.get_full_MSD([track.x, track.y]))
+        self.full_msd = np.mean(msd, axis=0)
+        self.full_msd_x = np.arange(0, len(self.full_msd))*self.frame_rate
+        return self.full_msd_x, self.full_msd
+
+    def save_data_gauss(self,filePath):
+        filename = filePath.name
+        combined_array = np.column_stack((self.x_full_gauss, self.Gauss_full_track))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tValue of the normalized Gaussian\n")
+
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        Histoy, Histox = np.histogram(self.Moyenner, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_red_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        filtered_data = np.array(self.Moyenner)[self.number_tracks_red]
+        nb_bins = int(np.max(filtered_data) / 5)
+        Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_green_data_hist(self,filePath):
+        filename = filePath.name
+        nb_bins = int(np.max(self.Moyenner)/5)
+        filtered_data = np.array(self.Moyenner)[self.number_tracks_green]
+        nb_bins = int(np.max(filtered_data) / 5)
+        Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
+        print(Histoy)
+        print(Histox)
+        Histoy = np.append(Histoy, 0)
+        combined_array = np.column_stack((Histox, Histoy))
+        with open(filename, 'w') as file:
+            # Write header
+            file.write("Radius (Nanometers)\tOccurence\n")
+            # Write data
+            for row in combined_array:
+                file.write(f"{row[0]}\t{row[1]}\n")
+
+    def save_state(self, filename):
+        """
+        Save the state of the object to a file using shelve.
+        """
+        print(filename)
+        with shelve.open(filename, 'n') as db:
+            for attr, value in self.__dict__.items():
+                db[attr] = value
+
+    def load_state(self, filename):
+        """
+        Load the state of the object from a file using shelve.
+        """
+        with shelve.open(filename, 'o') as db:
+            for attr, value in db.items():
+                setattr(obj, attr, value)
 
     def get_data_from_num_track(self, num):
         return self.tracks[num]
@@ -1022,16 +1605,13 @@ class AnalyzeTrackCore():
     def get_y_data(self, num):
         return self.tracks[num].y
 
-    # def filter_spots(self, spots, name, value, isabove):
-    #     if isabove:
-    #         spots = spots[spots[name] > value]
-    #     else:
-    #         spots = spots[spots[name] < value]
-    #
-    #     return spots
+
+
 
 if __name__ == "__main__":
     core = AnalyzeTrackCore()
+    print(core.space_units_nm)
     core.generate_brownian_track(params_dict=None)
     pass
+
 
