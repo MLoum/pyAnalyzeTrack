@@ -7,6 +7,9 @@ import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg, NavigationToolbar2Tk)
 import matplotlib.patches as patches
+from functools import partial
+import matplotlib.collections as collections
+from matplotlib.widgets import Slider
 
 from tkinter import filedialog, messagebox
 import os
@@ -164,8 +167,11 @@ class VideoPlayer(tk.Toplevel):
     def create_widgets(self):
         # Create a canvas for displaying the frames
 
-        self.canvas = tk.Canvas(self, width=self.frame_width, height=self.frame_height)
-        self.canvas.pack()
+        self.canvas_frame = tk.Frame(self)
+        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(self.canvas_frame)#, width=self.frame_width, height=self.frame_height)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
 
         self.label = tk.Label(self, text="Number of the track:")
@@ -174,6 +180,7 @@ class VideoPlayer(tk.Toplevel):
         # Entry
         self.track_number_entry = tk.Entry(self)
         self.track_number_entry.pack(side = "top")
+        self.track_number_entry.insert(0, " ")
 
         # Create a label to display the frame number
         self.reset_zoom = tk.Button(self, text="Zoom reset", command=self.zoom_reset)
@@ -185,6 +192,7 @@ class VideoPlayer(tk.Toplevel):
 
         button1 = ttk.Button(self, text="Informations", command=lambda: self.open_sub_window())
         button1.pack(pady=10)
+
 
 
         self.frame_label = tk.Label(self, text="Frame: 0")
@@ -256,9 +264,9 @@ class VideoPlayer(tk.Toplevel):
         self.button1 = ttk.Button(sub_window, text="Get overlap information", command=self.draw_overlap)
         self.button1.pack()
 
-        self.calculated_green.config(text=f" Number of momomers tracked: {self.core.compteur_green}")
-        self.calculated_red.config(text=f" Number of dimers tracked: {self.core.compteur_red}")
-        self.calculated_ratio.config(text=f" Ratio of monomers: {np.round(self.core.ratio, 4)} %")
+        self.calculated_green.config(text=f" Number of momomers tracked: {self.core.g}")
+        self.calculated_red.config(text=f" Number of dimers tracked: {self.core.r}")
+        self.calculated_ratio.config(text=f" Ratio of monomers: {np.round(self.core.ratio_green, 3)} %")
 
     def draw_overlap(self):
         self.core.overlap = 0
@@ -270,24 +278,26 @@ class VideoPlayer(tk.Toplevel):
         self.overlap_count.config(text=f" Number of overlaping positions : {self.core.overlap} ")
 
     def get_draw_track(self):
-
         track_number = self.track_number_entry.get()
 
-        position_track_x,position_track_y = self.core.calculate_draw_tracks(track_number)
+        position_track_x,position_track_y = self.core.calculate_draw_tracks(str(int(track_number)-1))
 
         # Example: Draw or update a box on the canvas
         # You should replace this with your actual drawing logic
         self.canvas.delete("track")  # Remove previous box
         self.canvas.delete("track_label")
+
+
+
         for i in range(np.size(position_track_x,0)) :
+
             x = position_track_x[i]
             y = position_track_y[i]
-
 
             zoomed_x = x * self.zoom_factor * self.zoom_factor_film - self.new_x
             zoomed_y = y * self.zoom_factor * self.zoom_factor_film - self.new_y
 
-            radius = 3 * self.zoom_factor * self.zoom_factor_film
+            radius = 0.2 * self.zoom_factor * self.zoom_factor_film
 
             x1 = zoomed_x - radius
             y1 = zoomed_y - radius
@@ -296,11 +306,25 @@ class VideoPlayer(tk.Toplevel):
 
             label_mouvement = 8 * self.zoom_factor * self.zoom_factor_film
 
+
+
+            #self.master.geometry(f"{int(window_width)}x{int(window_height)}")
+
+            #self.canvas.config(width=x_max - x_min, height=y_max - y_min)
+
+            #self.canvas.config(scrollregion=(x_min , y_min, x_max , y_max ))
+
+
             if i == 1 :
                 label_text = str(i)
                 self.canvas.create_text(zoomed_x-label_mouvement, zoomed_y, text=label_text, fill="white", tags="track_label")
 
             self.canvas.create_oval(x1, y1, x2, y2,outline="blue", width=2, tags="track")
+
+
+
+
+
 
     def zoom_reset(self):
         self.zoom_factor = 1.0
@@ -328,7 +352,7 @@ class VideoPlayer(tk.Toplevel):
             self.zoom_factor_film /= 1.1
 
         # Limit the zoom factor within a reasonable range
-        self.zoom_factor_film = max(0.1, min(5.0, self.zoom_factor_film))
+        self.zoom_factor_film = max(0.1, min(10.0, self.zoom_factor_film))
 
         # Update the frame with the new film zoom factor
 
@@ -380,8 +404,11 @@ class VideoPlayer(tk.Toplevel):
         self.canvas.config(width=zoomed_width, height=zoomed_height)
         self.canvas.create_image(-self.new_x, -self.new_y, anchor=tk.NW, image=self.tk_image)
 
+
         self.mouse_position_text = self.canvas.create_text(10, 10, text="test", anchor=tk.NW, fill="white")
         self.canvas.itemconfig(self.mouse_position_text, text=f"Mouse Position: (O, 0)")
+
+
 
 
         # Update the frame label
@@ -445,7 +472,6 @@ class VideoPlayer(tk.Toplevel):
 
     def draw_box(self, positions,tracker_red):
         # Example: Draw or update a box on the canvas
-        # You should replace this with your actual drawing logic
         self.canvas.delete("box")  # Remove previous box
         tracker = 0
         for position in positions :
@@ -476,7 +502,7 @@ class VideoPlayer(tk.Toplevel):
             self.zoom_factor /= 1.1  # Zoom out
 
         # Limit the zoom factor within a reasonable range
-        self.zoom_factor = max(0.1, min(5.0, self.zoom_factor))
+        self.zoom_factor = max(0.1, min(10.0, self.zoom_factor))
 
         # Update the frame with the new zoom factor
         self.update_frame_with_mouse_position(self.frame_number.get())
@@ -594,7 +620,7 @@ class pyAnalyzeTrack():
         self.iid_track_dict = {}
 
         # The string in the list correspond to the variable name of the Track class
-        self.list_plotable_and_filter_data = ["nSpots", "r_gauss", "r_msd", "r_cov", "red", "green", "blue"]
+        self.list_plotable_and_filter_data = ["nSpots", "r_gauss", "r_msd", "r_cov", "red", "green", "blue","asym"]
 
         self.create_gui()
         self.create_menu()
@@ -624,12 +650,12 @@ class pyAnalyzeTrack():
 
         # https://riptutorial.com/tkinter/example/31885/customize-a-treeview
         self.tree_view = ttk.Treeview(self.frame_treeview_track)
-        self.tree_view["columns"] = ("num", "nb Spot", "r gauss", "r cov", "r_msd", "color", "R", "G", "B")
+        self.tree_view["columns"] = ("num", "nb Spot", "r gauss", "r cov", "r_msd", "color", "R", "G", "B","asym")
         # remove first empty column with the identifier
         # self.tree_view['show'] = 'headings'
         # tree.column("#0", width=270, minwidth=270, stretch=tk.NO) tree.column("one", width=150, minwidth=150, stretch=tk.NO) tree.column("two", width=400, minwidth=200) tree.column("three", width=80, minwidth=50, stretch=tk.NO)
 
-        columns_text = ["num", "nb Spot", "r gauss", "r cov", "r_msd", "color", "R", "G", "B"]
+        columns_text = ["num", "nb Spot", "r gauss", "r cov", "r_msd", "color", "R", "G", "B","asym"]
 
         self.tree_view.column("#0", width=25, stretch=tk.NO)
         self.tree_view.column(columns_text[0], width=75, stretch=tk.YES, anchor=tk.CENTER)  # num
@@ -637,14 +663,15 @@ class pyAnalyzeTrack():
         self.tree_view.column(columns_text[2], width=125, stretch=tk.YES, anchor=tk.CENTER)  # r gauss
         self.tree_view.column(columns_text[3], width=125, stretch=tk.YES, anchor=tk.CENTER)  # r cov
         self.tree_view.column(columns_text[4], width=125, stretch=tk.YES, anchor=tk.CENTER)  # r msd
-        self.tree_view.column(columns_text[5], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Red
-        self.tree_view.column(columns_text[6], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Green
-        self.tree_view.column(columns_text[7], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Blue
+        self.tree_view.column(columns_text[5], width=125, stretch=tk.YES, anchor=tk.CENTER)  # color
+        self.tree_view.column(columns_text[6], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Red
+        self.tree_view.column(columns_text[7], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Green
+        self.tree_view.column(columns_text[8], width=75, stretch=tk.YES, anchor=tk.CENTER)  # Blue
+        self.tree_view.column(columns_text[9], width=75, stretch=tk.YES, anchor=tk.CENTER)
 
         # self.tree_view.heading("name", text="name")
         for col in columns_text:
-            self.tree_view.heading(col, text=col,
-                                   command=lambda _col=col: self.treeview_sort_column(self.tree_view, _col, False))
+            self.tree_view.heading(col, text=col,command=lambda _col=col: self.treeview_sort_column(self.tree_view, _col, False))
 
         # # FIXME only change text color to light gray
         self.tree_view.tag_configure('filtered', foreground='gray50')
@@ -858,8 +885,7 @@ class pyAnalyzeTrack():
 
         plt.subplots_adjust(hspace=0)
         self.fig_result_all_tracks.set_tight_layout(True)
-        self.canvas_result_all_tracks = FigureCanvasTkAgg(self.fig_result_all_tracks,
-                                                          master=self.frame_graph_all_tracks)
+        self.canvas_result_all_tracks = FigureCanvasTkAgg(self.fig_result_all_tracks,master=self.frame_graph_all_tracks)
         self.canvas_result_all_tracks.draw()
         # self.canvas_result_all_track.get_tk_widget().pack(side='top', fill='both', expand=1)
 
@@ -870,7 +896,9 @@ class pyAnalyzeTrack():
         cb = ttk.Combobox(self.frame_graph_all_tracks_params, width=13, justify=tk.CENTER,textvariable=self.plot_all_mode_sv,values='')
 
         # cb.bind('<<ComboboxSelected>>', self.change_algo)
-        cb['values'] = ('MLE Histogram','Sum gaussian', 'Lags', 'Radius Histogram', 'MSD', 'Radius Red Histogram', 'Radius Green Histogram')
+        cb['values'] = ('MLE Histogram','MLE Histogram Red','MLE Histogram Green','MLE Histogram Blue','Sum gaussian','Sum gaussian Red','Sum gaussian Green', 'Lags', 'Radius Histogram', 'MSD', 'Radius Red Histogram', 'Radius Green Histogram')
+        max_length = max(len(s) for s in cb['values'])
+        cb['width'] = max_length
         self.plot_all_mode_sv.set('Sum gaussian')
         cb.grid(row=0, column=0, padx=8)
 
@@ -1101,16 +1129,91 @@ class pyAnalyzeTrack():
         self.fig_result_all_tracks.set_tight_layout(True)
 
         if data_1_type == data_2_type:
-            hist, bin_edges = self.core.get_correlation_graph(data_1_type, data_2_type)
+            hist, bin_edges,track_ID = self.core.get_correlation_graph(data_1_type, data_2_type)
             self.ax_result_all_tracks.bar(bin_edges, hist)
         else:
-            x_axis, y_axis = self.core.get_correlation_graph(data_1_type, data_2_type)
-            self.ax_result_all_tracks.scatter(x_axis, y_axis)
+            self.x_axis, self.y_axis, self.track_ID, color_list = self.core.get_correlation_graph(data_1_type, data_2_type)
+            self.track_info = [f"Track {i}: {row}" for i, row in enumerate(self.track_ID)]
+            if all(x is "None" for x in color_list):
+                color_list[:] = ["Blue" for _ in color_list]
+            #self.scatter_plot =
+            self.ax_result_all_tracks.scatter(self.x_axis, self.y_axis, picker=True,color = color_list)
+            #self.ax_result_all_tracks.set_xscale('log')
+            #self.ax_result_all_tracks.set_yscale('log')
+            #ax_slider = self.fig_result_all_tracks.add_axes([0.2, 0.02, 0.6, 0.03])
+            #slider = Slider(ax_slider, "Factor", 0.1, 2.0, valinit=1.0)
+            self.fig_result_all_tracks.canvas.mpl_connect("pick_event",self.on_pick)
+
+            def update(val):
+                factor = slider.val
+                new_x = np.array(self.x_axis) * factor  # Modify x-axis data based on slider
+                self.scatter_plot.set_offsets(np.column_stack((new_x, self.y_axis)))  # Update the scatter plot data
+                self.fig_result_all_tracks.canvas.draw_idle()  # Refresh the figure
+
+            #slider.on_changed(update)
+
         self.ax_result_all_tracks.set_xlabel(data_1_type)
         self.ax_result_all_tracks.set_ylabel(data_2_type)
         self.fig_result_all_tracks.canvas.draw()
 
 
+
+
+    def open_info_window_track(self,track_info):
+        # Create a new window
+        info_window = tk.Toplevel()
+        info_window.title("Track Information")
+        variable_labels = ["Number of the track","First frame of the track","Number of positions", "Nanometer radius of the particle  (covariance)", "Nanometer incertitude on the radius", "Color","Asymetry"]
+
+        # Display the track info in a label
+        for var_name, value in zip(variable_labels, track_info[:-2]):  # Slice to exclude the last two items
+            tk.Label(info_window, text=f"{var_name}: {value}", padx=10, pady=5).pack()
+
+        plt.figure(figsize=(5, 4), dpi=100)
+        plt.plot(track_info[-2], track_info[-1], marker='o', linestyle='-')
+        plt.grid()
+        plt.title(f"Trajectory of the track {track_info[0]}")
+        plt.xlabel("x position")
+        plt.ylabel("y position")
+        plt.gca().invert_yaxis()
+
+        # Add annotations for start and end points
+        plt.annotate("Start",
+                     xy=(track_info[-2][0], track_info[-1][0]),
+                     xytext=(track_info[-2][0] + 1, track_info[-1][0] + 1),
+                     arrowprops=dict(arrowstyle="->", color="black"),
+                     color="black")
+        plt.annotate("End",
+                     xy=(track_info[-2][-1], track_info[-1][-1]),
+                     xytext=(track_info[-2][-1] - 1, track_info[-1][-1] - 1),
+                     arrowprops=dict(arrowstyle="->", color="black"),
+                     color="black")
+
+        fig = plt.gcf()  # Get the current figure
+        canvas = FigureCanvasTkAgg(fig, master=info_window)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas.draw()
+
+        self.filtered = tk.Button(info_window, text="Filter the track", command=lambda: self.filtered_click(track_info[0]))
+        self.filtered.pack(pady=20)
+
+
+
+    def filtered_click(self,track_info):
+        self.core.filtered_click(track_info)
+        self.update_ui()
+
+
+    def on_pick(self, event):
+        # Check if the picked artist is a scatter plot
+        if isinstance(event.artist, collections.PathCollection):  # Check if it's a scatter plot
+            ind = event.ind  # Index of the selected point(s)
+            print(f"Clicked on points: {ind}")
+            for i in ind:
+                track_data = self.track_ID[i]
+                self.open_info_window_track(track_data)
 
     def generate_data(self,params_dict):
         self.core.generate_brownian_track(params_dict)
@@ -1162,12 +1265,30 @@ class pyAnalyzeTrack():
             if track.is_highlighted:
                 tags_.append("highlighted")
 
+            if hasattr(track, "color_tracker") and track.color_tracker:
+                try:
+                    red = float(round_float(track.color_tracker[0]))
+                    green = float(round_float(track.color_tracker[1]))
+                    blue = float(round_float(track.color_tracker[2]))
+                    if red or green or blue != 0:
+                        tot = red+blue+green
+                        red = round(red*100/tot,1)
+                        green= round(green*100/tot,1)
+                        blue= round(blue*100/tot,1)
+                except (IndexError, TypeError):
+                    # Fallback if 'color_tracker' exists but is incomplete or invalid
+                    red, green, blue = 0, 0, 0
+            else:
+                # Default to "0" for all components if attribute is missing
+                red, green, blue = 0, 0, 0
+
             iid_track = self.tree_view.insert(parent="",index='end',values=(str(num_track),str(track.nSpots),round_float(track.r_gauss * 1E9) + "+/-" + round_float(track.r_gauss_err * 1E9),round_float(track.r_cov * 1E9) + "+/-" + round_float(track.error_r_cov * 1E9),
             round_float(track.r_msd * 1E9) + "+/-" + round_float(track.error_r_msd * 1E9),
             get_color(track),
-            str(round_float(track.colors[0])), # Red
-            str(round_float(track.colors[1])),  # Green
-            str(round_float(track.colors[2]))  # Blue
+            str(red), # Red
+            str(green),  # Green
+            str(blue), # Blue
+            track.asym
             ),
             tags = tags_
             )
@@ -1230,11 +1351,35 @@ class pyAnalyzeTrack():
         if self.plot_all_track_mode == "Sum gaussian":
             self.ax_result_all_tracks.clear()
             self.fig_result_all_tracks.set_tight_layout(True)
-
             params = {}
-            params["r_min_nm"] = 2
+            params["r_min_nm"] = 0
+            params["r_max_nm"] = 200
             r_max_nm = params["r_max_nm"] = 200
-            x, y = self.core.get_histogramm(type="gauss", params=params)
+            x, y = self.core.get_histogramm(type="gauss", method = "Covariance",params=params)
+            self.ax_result_all_tracks.plot(x, y)
+            self.ax_result_all_tracks.set_xlabel("Radius (nm)")
+            self.ax_result_all_tracks.set_ylabel("Sum of normalized gaussian")
+            self.fig_result_all_tracks.canvas.draw()
+        if self.plot_all_track_mode == "Sum gaussian Red":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+            params = {}
+            params["r_min_nm"] = 0
+            params["r_max_nm"] = 200
+            r_max_nm = params["r_max_nm"] = 200
+            x, y = self.core.get_histogramm(type="gauss Red", method = "Covariance",params=params)
+            self.ax_result_all_tracks.plot(x, y)
+            self.ax_result_all_tracks.set_xlabel("Radius (nm)")
+            self.ax_result_all_tracks.set_ylabel("Sum of normalized gaussian")
+            self.fig_result_all_tracks.canvas.draw()
+        if self.plot_all_track_mode == "Sum gaussian Green":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+            params = {}
+            params["r_min_nm"] = 0
+            params["r_max_nm"] = 200
+            r_max_nm = params["r_max_nm"] = 200
+            x, y = self.core.get_histogramm(type="gauss Green", method = "Covariance",params=params)
             self.ax_result_all_tracks.plot(x, y)
             self.ax_result_all_tracks.set_xlabel("Radius (nm)")
             self.ax_result_all_tracks.set_ylabel("Sum of normalized gaussian")
@@ -1245,9 +1390,46 @@ class pyAnalyzeTrack():
 
             #TODO GUI fo parameters
             params = {}
-            params["r_max_nm"] = 0
+            #params["r_max_nm"] = 0
             x, y = self.core.get_histogramm(type="MLE", params=params)
-            self.ax_result_all_tracks.plot(x, y)
+            #self.ax_result_all_tracks.hist(x, y)
+            self.ax_result_all_tracks.hist(x, weights=y, bins=40, color='grey', edgecolor = 'black')
+            self.ax_result_all_tracks.set_xlabel("Diameter (nm)")
+            self.ax_result_all_tracks.set_ylabel("MLE histogram")
+            self.fig_result_all_tracks.canvas.draw()
+        elif self.plot_all_track_mode == "MLE Histogram Red":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+
+            #TODO GUI fo parameters
+            params = {}
+            #params["r_max_nm"] = 0
+            x, y = self.core.get_histogramm(type="MLE_red", params=params)
+            self.ax_result_all_tracks.hist(x, weights=y, bins=40, color='grey', edgecolor = 'black')
+            self.ax_result_all_tracks.set_xlabel("Diameter (nm)")
+            self.ax_result_all_tracks.set_ylabel("MLE histogram")
+            self.fig_result_all_tracks.canvas.draw()
+        elif self.plot_all_track_mode == "MLE Histogram Green":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+
+            #TODO GUI fo parameters
+            params = {}
+            #params["r_max_nm"] = 0
+            x, y = self.core.get_histogramm(type="MLE_green", params=params)
+            self.ax_result_all_tracks.hist(x, weights=y, bins=40, color='grey', edgecolor = 'black')
+            self.ax_result_all_tracks.set_xlabel("Diameter (nm)")
+            self.ax_result_all_tracks.set_ylabel("MLE histogram")
+            self.fig_result_all_tracks.canvas.draw()
+        elif self.plot_all_track_mode == "MLE Histogram Blue":
+            self.ax_result_all_tracks.clear()
+            self.fig_result_all_tracks.set_tight_layout(True)
+
+                # TODO GUI fo parameters
+            params = {}
+                # params["r_max_nm"] = 0
+            x, y = self.core.get_histogramm(type="MLE_blue", params=params)
+            self.ax_result_all_tracks.hist(x, weights=y, bins=40, color='grey', edgecolor = 'black')
             self.ax_result_all_tracks.set_xlabel("Diameter (nm)")
             self.ax_result_all_tracks.set_ylabel("MLE histogram")
             self.fig_result_all_tracks.canvas.draw()
@@ -1273,37 +1455,47 @@ class pyAnalyzeTrack():
         elif self.plot_all_track_mode == "Radius Histogram":
             self.ax_result_all_tracks.clear()
             self.fig_result_all_tracks.set_tight_layout(True)
+
+            params = {}
+            #params["r_min_nm"] = 0
+            #params["r_max_nm"] = 200*1E-9
             #FIXME les autres méthodes (gauss et MSD)
-            histo_x, histo_y = self.core.get_histogramm(type="standart", method="Covariance")
+            histo_x, histo_y = self.core.get_histogramm(params=params,type="standard",method="Covariance")
             histo_x *= 1E9 # to nm
-            self.ax_result_all_tracks.bar(histo_x[:-1], histo_y, width=np.diff(histo_x), edgecolor='black')
+            valid_indices = histo_x[:-1] >= 0
+            filtered_x = histo_x[:-1][valid_indices]
+            filtered_y = histo_y[valid_indices]
+            filtered_width = np.diff(histo_x)[valid_indices]
+            self.ax_result_all_tracks.bar(filtered_x, filtered_y, width=filtered_width, edgecolor='black')
             #self.ax_result_all_tracks.set_xlim([self.core.lim_min *10 ** 9, self.core.lim_max * 10 ** 9])
             self.ax_result_all_tracks.set_xlabel("Radius (nm)")
             self.ax_result_all_tracks.set_ylabel("Occurence")
             self.fig_result_all_tracks.canvas.draw()
         elif self.plot_all_track_mode == "Radius Green Histogram":
+            params = {}
             self.ax_result_all_tracks.clear()
             self.fig_result_all_tracks.set_tight_layout(True)
-            filtered_data = np.array(self.core.Moyenner)[self.core.number_tracks_green]
-            filtered_data = np.array(filtered_data)[np.array(filtered_data) <= self.core.lim_max * 10 ** 9]
-            Histoy, Histox = np.histogram(filtered_data, bins=int(self.core.lim_max * 10 ** 9 / 5))
-            print("Bin =", Histox)
-            print("Values =", Histoy)
-            self.ax_result_all_tracks.bar(Histox[:-1], Histoy, width=np.diff(Histox), edgecolor='black')
-            self.ax_result_all_tracks.set_xlim([self.core.lim_min * 10 ** 9, self.core.lim_max * 10 ** 9])
+            histo_x, histo_y = self.core.get_histogramm_color(params=params,method="Green", type="standard")
+            histo_x *= 1E9  # to nm
+            valid_indices = histo_x[:-1] >= 0
+            filtered_x = histo_x[:-1][valid_indices]
+            filtered_y = histo_y[valid_indices]
+            filtered_width = np.diff(histo_x)[valid_indices]
+            self.ax_result_all_tracks.bar(filtered_x, filtered_y, width=filtered_width, edgecolor='black')
             self.ax_result_all_tracks.set_xlabel("Radius (nm) of green track")
             self.ax_result_all_tracks.set_ylabel("Occurence")
             self.fig_result_all_tracks.canvas.draw()
         elif self.plot_all_track_mode == "Radius Red Histogram":
+            params = {}
             self.ax_result_all_tracks.clear()
             self.fig_result_all_tracks.set_tight_layout(True)
-            filtered_data = np.array(self.core.Moyenner)[self.core.number_tracks_red]
-            filtered_data = np.array(filtered_data)[np.array(filtered_data) <= self.core.lim_max * 10 ** 9]
-            Histoy, Histox = np.histogram(filtered_data, bins=int(self.core.lim_max * 10 ** 9 / 5))
-            print("Bin =", Histox)
-            print("Values =", Histoy)
-            self.ax_result_all_tracks.bar(Histox[:-1], Histoy, width=np.diff(Histox), edgecolor='black')
-            self.ax_result_all_tracks.set_xlim([self.core.lim_min * 10 ** 9, self.core.lim_max * 10 ** 9])
+            histo_x, histo_y = self.core.get_histogramm_color(params=params, method="Red", type="standard")
+            histo_x *= 1E9  # to nm
+            valid_indices = histo_x[:-1] >= 0
+            filtered_x = histo_x[:-1][valid_indices]
+            filtered_y = histo_y[valid_indices]
+            filtered_width = np.diff(histo_x)[valid_indices]
+            self.ax_result_all_tracks.bar(filtered_x, filtered_y, width=filtered_width, edgecolor='black')
             self.ax_result_all_tracks.set_xlabel("Radius (nm) of red track")
             self.ax_result_all_tracks.set_ylabel("Occurence")
             self.fig_result_all_tracks.canvas.draw()
