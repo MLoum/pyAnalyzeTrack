@@ -13,11 +13,13 @@ TODO :
 
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 import xml.etree.cElementTree as et
 from lmfit import Model
 from scipy.fftpack import dst
-#import CoolProp
-#from CoolProp.CoolProp import PropsSI
+import CoolProp
+from CoolProp.CoolProp import PropsSI
 
 #import pandas as pd
 import os
@@ -238,7 +240,8 @@ class Track:
         self.gauss_diff_hist_abs = boundaries
         self.gauss_diff_result = result
         nb_spot = nb_spot_x + nb_spot_y
-        self.D_gauss, self.r_gauss, self.r_gauss_err = D_from_fit(center.value, width.value, nb_spot, params)
+        #self.D_gauss, self.r_gauss, self.r_gauss_err = D_from_fit(center.value, width.value, nb_spot, params)
+        self.D_gauss, self.r_gauss, self.r_gauss_err = 0,0,0
 
         #self.r_gauss = (rx + ry)/2
 
@@ -377,8 +380,9 @@ class Track:
             diff_y = self.calculate_displacement(posy * space_units_nm * 1E-9, algo="None")
 
             # FIXME implement other drift compensation algorithm ?
-            driftx = np.nanmean(diff_x)
-            drifty = np.nanmean(diff_y)
+            driftx = 0#np.nanmean(diff_x)
+
+            drifty = 0#np.nanmean(diff_y)
             MSD = np.mean((diff_x-driftx)**2+(diff_y-drifty)**2)
 
             # covariance = np.mean((diff[:-1]) * (diff[1:]))
@@ -406,6 +410,7 @@ class Track:
 
         self.D_cov, self.r_cov, self.var_D_cov, self.var_r_cov = calculate_cov_2D(self.x,self.y, params)
         self.error_r_cov = self.var_r_cov
+        self.error_percent = round(self.var_r_cov / self.r_cov, 2)
 
     def get_full_MSD(self, positions):
         """
@@ -581,12 +586,13 @@ class AnalyzeTrackCore():
         self.frames = None # List of Frame objects
         self.nFrames = 0
         self.frameInterval = None
-        self.space_units_nm = 240 # pour la caméra ximéa -> FIXME Hardcoded
-        #self.space_units_nm = 172.5 #pour la camera IDS # in nm
+        #self.space_units_nm = 240 # pour la caméra ximéa -> FIXME Hardcoded
+        self.space_units_nm = 172.5 #pour la camera IDS # in nm
         self.frame_rate = 1 / 120 #   # FIXME Harcoded
-        self.T = 293    #in K
-        #self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
-        self.eta = 0.001
+        self.T = 273.15+18   #in K
+        self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
+        print('self.eta',self.eta)
+        #self.eta = 0.001
         self.sigma_already_known = False
         self.R = 1/6    #FIXME ?
         self.division = 10
@@ -803,7 +809,363 @@ class AnalyzeTrackCore():
             self.y_histo, self.x_histo = np.histogram(radius_list,bins = 40)#,range=(params["r_min_nm"],params["r_max_nm"]))
             return self.x_histo, self.y_histo
 
+    def distance(self,point,centroid):
+        d1 = np.abs(point-centroid[0])
+        d2 = np.abs(point-centroid[1])
+        dist = (d1,d2)
+        #print(centroid[0])
+        #print("..")
+        return dist
 
+    def argmin(self,distance):
+        if distance[0] > distance[1]:
+            return 1
+        else:
+            return 0
+    def calculate_centroid(self,cluster):
+        c1 = np.mean(cluster[0])
+        c2 = np.mean(cluster[1])
+        return [c1,c2]
+
+    def GMM_method(self,points,k,error):
+        initial_centroids = np.array([[3, 33], [40, 47]])
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:,1]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k,init= initial_centroids, random_state=42)
+        kmeans.fit(points_clean)
+
+        gmm = GaussianMixture(n_components=k, covariance_type='full',init_params='kmeans', random_state=42)
+        gmm.means_init = kmeans.cluster_centers_
+
+        gmm.fit(points_clean)
+        labels = gmm.predict(points_clean)
+
+        label_counts = np.bincount(labels)
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]# Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+        r_min_nm = 0
+        i=0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0)-1 :
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+            #print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green /10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i=0
+
+        while i < len(points_label_1)-1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+
+        plt.plot(x_histo,y_histo)
+        plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red  / 10
+
+
+        return labels,label_counts,Max_green,Max_red,points_clean
+    def GMM_3D(self,k):
+
+        points = []
+        error = []
+        track_ID = []
+        i=-1
+        for track in self.tracks:
+            if not (0 < track.r_cov * 1e9 < 200):
+                track.is_filtered = True
+            if float(track.asym) > 3 :
+                track.is_filtered = True
+
+            if not track.is_filtered:
+                i= i+1
+                points.append([track.r_cov, track.Value_red, track.Value_green])
+                error.append(track.error_r_cov)
+                row = [
+                    i,
+                    int(track.f[0]),
+                    track.nSpots,
+                    np.round(track.r_cov * 1e9, 2),
+                    np.round(track.error_r_cov * 1e9, 2),
+                    "Nan",
+                    float(track.asym),
+                    float(track.error_percent),
+                    track.x,
+                    track.y]
+                track_ID.append(row)
+            else :
+                i=i+1
+
+        points = np.array(points)
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 0]
+        error_clean = error[valid_indices]
+
+
+        gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
+
+        gmm.fit(points_clean)
+        labels = gmm.predict(points_clean)
+
+        label_counts = np.bincount(labels)
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]# Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+        r_min_nm = 0
+        i=0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0)-1 :
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+            #print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green /10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i=0
+
+        while i < len(points_label_1)-1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+
+        #plt.plot(x_histo,y_histo)
+        #plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red  / 10
+
+
+        return labels,label_counts,Max_green,Max_red,points_clean,track_ID
+
+    def Kmeans_3D(self,k):
+        points = []
+        error = []
+        track_ID = []
+        i = -1
+        for track in self.tracks :
+            if not (0 < track.r_cov * 1e9 < 200):
+                track.is_filtered = True
+            if float(track.asym) > 3 :
+                track.is_filtered = True
+            if not track.is_filtered:
+                i=i+1
+                points.append([track.r_cov,track.Value_red,track.Value_green])
+                error.append(track.error_r_cov)
+
+                row = [
+                    i,
+                    int(track.f[0]),
+                    track.nSpots,
+                    np.round(track.r_cov * 1e9, 2),
+                    np.round(track.error_r_cov * 1e9, 2),
+                    "Nan",
+                    float(track.asym),
+                    float(track.error_percent),
+                    track.x,
+                    track.y]
+                track_ID.append(row)
+            else:
+                i = i + 1
+
+        points = np.array(points)
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 0]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k, init="k-means++", random_state=42)
+        kmeans.fit(points_clean)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+        counts = np.bincount(labels)
+
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]  # Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+
+        r_min_nm = 0
+        i = 0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0) - 1:
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+            # print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green / 10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i = 0
+
+        while i < len(points_label_1) - 1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+
+        #plt.plot(x_histo, y_histo)
+        #plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red / 10
+
+        return labels, counts, Max_green, Max_red, points_clean,track_ID
+
+        return
+
+    def Kmeans_method(self, points, k,error):
+        initial_centroids = np.array([[3, 33], [40, 47]])
+
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 1]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k,init= initial_centroids, random_state=42,algorithm = "lloyd")
+        kmeans.fit(points_clean)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+        counts = np.bincount(labels)
+
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]  # Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+
+        r_min_nm = 0
+        i = 0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0) - 1:
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+            # print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green / 10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i = 0
+
+        while i < len(points_label_1) - 1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+
+        plt.plot(x_histo, y_histo)
+        plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red / 10
+
+        return labels, counts, Max_green, Max_red, points_clean
+
+
+
+    def Kmeans_method_2(self,points, k = 2):
+
+        # Initialization: choose k centroids (Forgy, Random Partition, etc.)t
+        c1 = (33)
+        c2 = (47)
+        centroids = (c1,c2)
+
+        # Initialize clusters list
+        clusters = [[] for _ in range(k)]
+
+        # Loop until convergence
+        converged = False
+        while not converged:
+            # Clear previous clusters
+            clusters = [[] for _ in range(k)]
+
+            # Assign each point to the "closest" centroid
+            for point in points:
+                #print(point)
+                distances_to_each_centroid = self.distance(point*10**9, centroids)
+                #print(distances_to_each_centroid)
+                #print("...")
+                cluster_assignment = self.argmin(distances_to_each_centroid)
+                clusters[cluster_assignment].append(point*10**9)
+
+            # Calculate new centroids
+            #   (the standard implementation uses the mean of all points in a
+            #     cluster to determine the new centroid)
+            new_centroids = self.calculate_centroid(clusters)
+
+            converged = (np.round(new_centroids,4) == np.round(centroids,4))
+            print(converged)
+            print(new_centroids,centroids)
+            print("//")
+            centroids = new_centroids
+
+            if converged:
+                print(clusters)
+        
     def get_histogramm(self, params,type="standard", method = "Covariance"):
         if type == "standard":
             #method = params["method"]
@@ -855,6 +1217,22 @@ class AnalyzeTrackCore():
                         variance = track.error_r_cov
                         r = track.r_cov
                         gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance ** 2))
+                        gaussian *= 1E9  # to nm
+                        self.y_histo += gaussian
+            return self.x_histo, self.y_histo
+        elif type == 'GMM green':
+            r_min_nm = params["r_min_nm"]
+            r_max_nm = params["r_max_nm"]
+            nb_pt_in_histo = 10 * r_max_nm
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+            self.y_histo = np.zeros(nb_pt_in_histo)
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if track.color == 0:
+                        variance = track.error_r_cov
+                        r = track.r_cov
+                        gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(
+                            -(self.x_histo - r) ** 2 / (2 * variance ** 2))
                         gaussian *= 1E9  # to nm
                         self.y_histo += gaussian
             return self.x_histo, self.y_histo
@@ -1266,7 +1644,6 @@ class AnalyzeTrackCore():
 
         self.current_task = "Analyze momomere"
         self.Analyze_color()
-        self.get_ratio_color()
 
         self.current_task = "Idle"
 
@@ -1329,20 +1706,21 @@ class AnalyzeTrackCore():
         tracker_color = []
         if self.tracks != None :
             for track in self.tracks :
-                index = np.where(track.t  == frame_number)[0]
-                if index.size > 0 :
-                    #if track.x[index] != None:
-                    x = track.x[index[0]]
-                    #if track.y[index] != None:
-                    y = track.y[index[0]]
-                    if self.video_array_red[int(y),int(x),frame_number] > self.video_array_green[int(y),int(x),frame_number] :
-                        tracker_red = 1
-                    else :
-                        tracker_red = 0
+                if not track.is_filtered :
+                    index = np.where(track.t  == frame_number)[0]
+                    if index.size > 0 :
+                        #if track.x[index] != None:
+                        x = track.x[index[0]]
+                        #if track.y[index] != None:
+                        y = track.y[index[0]]
+                        if self.video_array_red[int(y),int(x),frame_number]*self.alpha_red > self.video_array_green[int(y),int(x),frame_number] :
+                            tracker_red = 1
+                        else :
+                            tracker_red = 0
 
-                    tracker_color.append(tracker_red)
-                    position.append((x, y))
-            #print(position)
+                        tracker_color.append(tracker_red)
+                        position.append((x, y))
+                #print(position)
 
 
         return position,tracker_color
@@ -1351,7 +1729,7 @@ class AnalyzeTrackCore():
         """
         :return:
         """
-
+        self.color_data = []
         self.box_radius = 4 #params["Analyze_particle_box_size_in_pixel"]    # ? FIXME Hardcoded
         self.red = 0
         self.green = 0
@@ -1360,20 +1738,24 @@ class AnalyzeTrackCore():
             # For each spot in one track, we calculate the value of the red and green canal around the particle in a size self.
             track.spot_colors = []
             track.spot_main_color = []
-            Value_red = 0
-            Value_green = 0
-            Value_blue = 0
+            self.alpha_red = 1
+            track.Value_red = 0
+            track.Value_green = 0
+            track.Value_blue = 0
             for m in range(np.size(track.x)):
                 #FIXME pourquoi -1 sur le compteur temps ?
-                Value_red += np.sum(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
-                Value_green += np.sum(self.video_array_green[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
-                Value_blue += np.sum(self.video_array_blue[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius,int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_red += np.sum(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                #print(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_green += np.sum(self.video_array_green[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_blue += np.sum(self.video_array_blue[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius,int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
 
 
-            color = [1*Value_red, 1*Value_green, Value_blue]
+            color = [self.alpha_red*track.Value_red, 1*track.Value_green, track.Value_blue]
             track.color_tracker = color
             #track.spot_colors.append(color)
-
+            track.Value_red = track.Value_red/ ((4*self.box_radius**2)*np.size(track.x))
+            track.Value_green = track.Value_green / ((4*self.box_radius**2)*np.size(track.x))
+            track.Value_blue = track.Value_blue / ((4*self.box_radius**2)*np.size(track.x))
             #track.spot_main_color.append(np.argmax(color))   # 0 for red, 1 for green, 2 for blue
 
             # Attribute color to the track -> Among all spots, what color was the most present.
@@ -1408,6 +1790,22 @@ class AnalyzeTrackCore():
     def exportData(self, filename):
         data = (self.Moyenner)
         np.savetxt(filename, data,newline='\n')
+
+    def exported_data_list(self) :
+        # Je filtre les track avec r_cov < 200 et asym < 3 directement dans les fonctions GMM_3D et Kmeans_3D pour l'export de liste donc attention !
+        # j'aime pas coder des filtre en dur mais j'ai pas trop le choix si je veux un export automatique de plusieurs fichiers sans passer par le GUI
+        # (pour ca que j'aime pas les scripts c'est trop rigide et le logiciel a pas ete prevu pour etre rigide c'est meme la raison pour laquelle on a fait un logiciel menfin)
+        data = []
+        labels, label_counts, Max_green, Max_red, points_clean,track_id = self.GMM_3D(2)
+        data.append( np.round(label_counts[0] * 100 / (label_counts[0] + label_counts[1]), 2))
+        data.append( Max_green)
+        data.append( Max_red)
+        labels, label_counts, Max_green, Max_red, points_clean,track_id = self.Kmeans_3D(2)
+        data.append( np.round(label_counts[0] * 100 / (label_counts[0] + label_counts[1]), 2))
+        data.append( Max_green)
+        data.append( Max_red )
+
+        return data
 
 
     def get_all_delta_in_chronological_order(self):
@@ -1586,6 +1984,12 @@ class AnalyzeTrackCore():
                 val = track.red_mean
             elif type == "asym" :
                 val = float(track.asym)
+            elif type == "error_percent" :
+                val = float(track.error_percent)
+            elif type == "Absolute red" :
+                val = float(track.Value_red)
+            elif type == "Absolute green" :
+                val = float(track.Value_green)
 
 
             if val is None:
@@ -1632,6 +2036,7 @@ class AnalyzeTrackCore():
     def get_correlation_graph(self, data_1_type, data_2_type):
         x_axis = []
         y_axis = []
+        y_axis_error = []
         track_ID = []
         color_list = []
         def get_data_from_type(track, type):
@@ -1651,6 +2056,8 @@ class AnalyzeTrackCore():
                 return track.color_tracker[2]*100/(track.color_tracker[0]+track.color_tracker[1]+track.color_tracker[2])
             elif type == "asym" :
                 return float(track.asym)
+            elif type == "error_percent" :
+                return float(track.error_percent)
 
         if data_1_type == data_2_type:
             data_histo = []
@@ -1661,7 +2068,7 @@ class AnalyzeTrackCore():
 
             # We have to create an histogramm
             hist, bin_edges = np.histogram(data_histo)
-            return hist, bin_edges
+            return hist, bin_edges , track_ID
 
         i=-1
         for track in self.tracks:
@@ -1670,6 +2077,7 @@ class AnalyzeTrackCore():
                 continue
             i += 1
             x_axis.append(get_data_from_type(track, data_1_type))
+            y_axis_error.append(track.error_r_cov)
             if track.color == 0:
                 color = "Red"
             elif track.color == 1:
@@ -1686,13 +2094,14 @@ class AnalyzeTrackCore():
                 np.round(track.error_r_cov*1e9,2),
                 color,
                 float(track.asym),
+                float(track.error_percent),
                 track.x,
                 track.y]
             track_ID.append(row)
             y_axis.append(get_data_from_type(track, data_2_type))
             color_list.append(color)
 
-        return x_axis, y_axis,track_ID,color_list
+        return x_axis, y_axis,track_ID,color_list,y_axis_error
 
     def clear_filter(self):
         for track in self.tracks:
