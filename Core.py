@@ -13,11 +13,13 @@ TODO :
 
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 import xml.etree.cElementTree as et
 from lmfit import Model
 from scipy.fftpack import dst
-#import CoolProp
-#from CoolProp.CoolProp import PropsSI
+import CoolProp
+from CoolProp.CoolProp import PropsSI
 
 #import pandas as pd
 import os
@@ -238,7 +240,8 @@ class Track:
         self.gauss_diff_hist_abs = boundaries
         self.gauss_diff_result = result
         nb_spot = nb_spot_x + nb_spot_y
-        self.D_gauss, self.r_gauss, self.r_gauss_err = D_from_fit(center.value, width.value, nb_spot, params)
+        #self.D_gauss, self.r_gauss, self.r_gauss_err = D_from_fit(center.value, width.value, nb_spot, params)
+        self.D_gauss, self.r_gauss, self.r_gauss_err = 0,0,0
 
         #self.r_gauss = (rx + ry)/2
 
@@ -369,12 +372,45 @@ class Track:
             return -1, -1, -1, -1
 
 
-        self.Dx_cov, rx_cov, self.var_Dx_cov, self.var_rx_cov = caculate_cov_1D(self.x, params)
-        self.Dy_cov, ry_cov, self.var_Dy_cov, self.var_ry_cov = caculate_cov_1D(self.y, params)
-        self.r_cov = (rx_cov + ry_cov)/2
-        self.D_cov = (self.Dx_cov + self.Dy_cov) / 2
-        self.error_r_cov = (self.var_rx_cov + self.var_ry_cov)/2
 
+
+        def calculate_cov_2D(posx,posy, params):
+
+            diff_x = self.calculate_displacement(posx * space_units_nm * 1E-9, algo="None")
+            diff_y = self.calculate_displacement(posy * space_units_nm * 1E-9, algo="None")
+
+            # FIXME implement other drift compensation algorithm ?
+            driftx = 0#np.nanmean(diff_x)
+
+            drifty = 0#np.nanmean(diff_y)
+            MSD = np.mean((diff_x-driftx)**2+(diff_y-drifty)**2)
+
+            # covariance = np.mean((diff[:-1]) * (diff[1:]))
+            covariance = np.mean((diff_x[:-1]-driftx) * (diff_x[1:]-driftx)+(diff_y[:-1]-drifty) * (diff_y[1:]-drifty))
+
+            sigma_square = R * MSD + (2 * R - 1) * covariance
+
+            D_cov = (MSD - 2 * sigma_square) / ((4 - 8 * R) * timeUnits)
+            # FIXME why does it happen ?
+            #if D_cov <= 0:
+            #    return -1, -1, -1, -1
+            r_cov_2 = (kb_ * T) / (6 * np.pi * eta * D_cov)
+
+            epsilon = sigma_square / (D_cov * timeUnits) - 2 * R
+            N = self.nSpots
+            var_D_cov_first_order = (6 + 4 * epsilon + 2 * epsilon ** 2) / N
+            var_D_cov_second_order = (4 * (1 + epsilon) ** 2) / (N ** 2)
+            var_D_cov = D_cov ** 2 * (var_D_cov_first_order + var_D_cov_second_order)
+            var_D_cov = np.sqrt(var_D_cov)
+            error_r_cov_1 = kb_ * T / (6 * np.pi * eta * (D_cov + var_D_cov))
+            error_r_cov_2 = kb_ * T / (6 * np.pi * eta * (D_cov - var_D_cov))
+            var_r_cov = np.absolute((error_r_cov_1 - error_r_cov_2) / 2)
+
+            return D_cov, r_cov_2, var_D_cov, var_r_cov
+
+        self.D_cov, self.r_cov, self.var_D_cov, self.var_r_cov = calculate_cov_2D(self.x,self.y, params)
+        self.error_r_cov = self.var_r_cov
+        self.error_percent = round(self.var_r_cov / self.r_cov, 2)
 
     def get_full_MSD(self, positions):
         """
@@ -428,9 +464,32 @@ class Track:
             self.green = np.mean(selected_frames[y_start :y_end+1, x_start:x_end+1])
             self.green_mean = np.mean(self.green)
 
+
+
+
+    def Tensor_brownian(self,params):
+        space_units_nm = params["space_units_nm"]
+        diff_x = self.calculate_displacement(self.x * space_units_nm *1E-9, algo="None")
+        diff_y = self.calculate_displacement(self.y * space_units_nm  *1e-9, algo="None")
+        Tensor = np.zeros((2,2))
+        Tensor[0][0] = np.mean(diff_x ** 2) - np.mean(diff_x) ** 2
+        Tensor[0][1] = np.mean(diff_x * diff_y) - np.mean(diff_x) * np.mean(diff_y)
+        Tensor[1][0] = Tensor[0][1]
+        Tensor[1][1] = np.mean(diff_y ** 2) - np.mean(diff_y) ** 2
+        eigenvalues, eigenvectors = np.linalg.eig(Tensor)
+        R1 = np.sqrt(eigenvalues[0])
+        R2 = np.sqrt(eigenvalues[1])
+        RG = np.sqrt(R1 + R2)
+        self.asym = -np.log10(1 - ((R1 - R2) ** 2 )/ (2 * RG ** 2))
+        self.asym = format(self.asym*1e9, ".2e")
+        #print("R2",R2)
+
+
+
 """
 En dehors des class pour pouvoir le sérialiser lors des processus multicore
 """
+
 def init_track(data, params):
     """
     Using ProcessPoolExecutor has the disadvantage that each child process runs in its own memory space,
@@ -455,6 +514,7 @@ def init_track(data, params):
     track.y = data[:, 4]
     track.z = data[:, 5]
     track.t = data[:, 6]
+    track.f = data[:,7]
     track.r_trackmate = data[:, 8] # This is the "RADIUS" column, the value is fixed and correspond to the one given by the user during the spot detection.
     # track.r_trackmate = data[:, 17] # This is ESTIMATED_DIAMETER, should be better.
     #TODO Add contrast and/or SNR.
@@ -464,6 +524,8 @@ def init_track(data, params):
     track.calculate_D_from_gauss(params)
     track.calculate_D_from_MSD(params)
     track.calculate_D_from_covariance(params)
+    track.Tensor_brownian(params)
+
 
     # Ini value for colors -> no color since the tracking was done with a grey value movie
     track.colors = [0, 0 ,0]
@@ -524,12 +586,13 @@ class AnalyzeTrackCore():
         self.frames = None # List of Frame objects
         self.nFrames = 0
         self.frameInterval = None
-        self.space_units_nm = 240 # pour la caméra ximéa -> FIXME Hardcoded
-        #self.space_units_nm = 172.5 #pour la camera IDS # in nm
-        self.frame_rate = 1 / 60 #   # FIXME Harcoded
-        self.T = 293    #in K
-        #self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
-        self.eta = 0.001
+        #self.space_units_nm = 240 # pour la caméra ximéa -> FIXME Hardcoded
+        self.space_units_nm = 172.5 #pour la camera IDS # in nm
+        self.frame_rate = 1 / 120 #   # FIXME Harcoded
+        self.T = 273.15+18   #in K
+        self.eta = PropsSI('V', 'T', self.T, 'P', 101325., 'water')    # in Pa.s
+        print('self.eta',self.eta)
+        #self.eta = 0.001
         self.sigma_already_known = False
         self.R = 1/6    #FIXME ?
         self.division = 10
@@ -723,15 +786,389 @@ class AnalyzeTrackCore():
                 if num_frame >= nb_frame + 1:
                     dummy = 1
                 self.frames[num_frame].spots.append(spot)
-
         self.get_stats()
+
 
         self.current_task = "idle"
 
+    def get_histogramm_color(self, params,method,type="standard"):
+        if type == "standard":
+            #method = params["method"]
+            radius_list =[]
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if method == "Red":
+                        if track.color == 0:
+                            radius_list.append(track.r_cov)
+                    elif method == "Green":
+                        if track.color == 1:
+                            radius_list.append(track.r_cov)
+                    elif method == "Blue":
+                        if track.color == 2:
+                            radius_list.append(track.r_cov)
+            self.y_histo, self.x_histo = np.histogram(radius_list,bins = 40)#,range=(params["r_min_nm"],params["r_max_nm"]))
+            return self.x_histo, self.y_histo
 
-    def get_histogramm(self, type="standart", params=None):
-        if type == "standart":
-            method = params["method"]
+    def distance(self,point,centroid):
+        d1 = np.abs(point-centroid[0])
+        d2 = np.abs(point-centroid[1])
+        dist = (d1,d2)
+        #print(centroid[0])
+        #print("..")
+        return dist
+
+    def argmin(self,distance):
+        if distance[0] > distance[1]:
+            return 1
+        else:
+            return 0
+    def calculate_centroid(self,cluster):
+        c1 = np.mean(cluster[0])
+        c2 = np.mean(cluster[1])
+        return [c1,c2]
+
+    def GMM_method(self,points,k,error):
+        initial_centroids = np.array([[3, 33], [40, 47]])
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:,1]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k,init= initial_centroids, random_state=42)
+        kmeans.fit(points_clean)
+
+        gmm = GaussianMixture(n_components=k, covariance_type='full',init_params='kmeans', random_state=42)
+        gmm.means_init = kmeans.cluster_centers_
+
+        gmm.fit(points_clean)
+        labels = gmm.predict(points_clean)
+
+        label_counts = np.bincount(labels)
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]# Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+        r_min_nm = 0
+        i=0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0)-1 :
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+            #print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green /10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i=0
+
+        while i < len(points_label_1)-1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+
+        plt.plot(x_histo,y_histo)
+        plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red  / 10
+
+
+        return labels,label_counts,Max_green,Max_red,points_clean
+    def GMM_3D(self,k):
+
+        points = []
+        error = []
+        track_ID = []
+        i=-1
+        for track in self.tracks:
+            if not (0 < track.r_cov * 1e9 < 200):
+                track.is_filtered = True
+            if float(track.asym) > 3 :
+                track.is_filtered = True
+
+            if not track.is_filtered:
+                i= i+1
+                points.append([track.r_cov, track.Value_red, track.Value_green])
+                error.append(track.error_r_cov)
+                row = [
+                    i,
+                    int(track.f[0]),
+                    track.nSpots,
+                    np.round(track.r_cov * 1e9, 2),
+                    np.round(track.error_r_cov * 1e9, 2),
+                    "Nan",
+                    float(track.asym),
+                    float(track.error_percent),
+                    track.x,
+                    track.y]
+                track_ID.append(row)
+            else :
+                i=i+1
+
+        points = np.array(points)
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 0]
+        error_clean = error[valid_indices]
+
+
+        gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
+
+        gmm.fit(points_clean)
+        labels = gmm.predict(points_clean)
+
+        label_counts = np.bincount(labels)
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]# Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+        r_min_nm = 0
+        i=0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0)-1 :
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+            #print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green /10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i=0
+
+        while i < len(points_label_1)-1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i+=1
+
+        #plt.plot(x_histo,y_histo)
+        #plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red  / 10
+
+
+        return labels,label_counts,Max_green,Max_red,points_clean,track_ID
+
+    def Kmeans_3D(self,k):
+        points = []
+        error = []
+        track_ID = []
+        i = -1
+        for track in self.tracks :
+            if not (0 < track.r_cov * 1e9 < 200):
+                track.is_filtered = True
+            if float(track.asym) > 3 :
+                track.is_filtered = True
+            if not track.is_filtered:
+                i=i+1
+                points.append([track.r_cov,track.Value_red,track.Value_green])
+                error.append(track.error_r_cov)
+
+                row = [
+                    i,
+                    int(track.f[0]),
+                    track.nSpots,
+                    np.round(track.r_cov * 1e9, 2),
+                    np.round(track.error_r_cov * 1e9, 2),
+                    "Nan",
+                    float(track.asym),
+                    float(track.error_percent),
+                    track.x,
+                    track.y]
+                track_ID.append(row)
+            else:
+                i = i + 1
+
+        points = np.array(points)
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 0]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k, init="k-means++", random_state=42)
+        kmeans.fit(points_clean)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+        counts = np.bincount(labels)
+
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]  # Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+
+        r_min_nm = 0
+        i = 0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0) - 1:
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+            # print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green / 10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i = 0
+
+        while i < len(points_label_1) - 1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+
+        #plt.plot(x_histo, y_histo)
+        #plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red / 10
+
+        return labels, counts, Max_green, Max_red, points_clean,track_ID
+
+        return
+
+    def Kmeans_method(self, points, k,error):
+        initial_centroids = np.array([[3, 33], [40, 47]])
+
+        error = np.array(error)
+        valid_indices = ~np.isnan(points).any(axis=1)
+
+        points_clean = points[valid_indices]
+        radius_data = points_clean[:, 1]
+        error_clean = error[valid_indices]
+
+        kmeans = KMeans(n_clusters=k,init= initial_centroids, random_state=42,algorithm = "lloyd")
+        kmeans.fit(points_clean)
+        labels = kmeans.labels_
+        centroids = kmeans.cluster_centers_
+        counts = np.bincount(labels)
+
+        points_label_0 = radius_data[labels == 0]
+        error_points_0 = error_clean[labels == 0]  # Points assigned to the first label
+        points_label_1 = radius_data[labels == 1]
+        error_points_1 = error_clean[labels == 1]
+
+        r_min_nm = 0
+        i = 0
+        r_max_nm = 200
+        nb_pt_in_histo = 10 * r_max_nm
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        while i < len(points_label_0) - 1:
+            variance = error_points_0[i]
+            r = points_label_0[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+            # print(i)
+
+        Max_green = np.argmax(y_histo)
+
+        Max_green = Max_green / 10
+
+        x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+        y_histo = np.zeros(nb_pt_in_histo)
+        i = 0
+
+        while i < len(points_label_1) - 1:
+            variance = error_points_1[i]
+            r = points_label_1[i]
+            gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(x_histo - r) ** 2 / (2 * variance ** 2))
+            gaussian *= 1E9  # to nm
+            y_histo += gaussian
+            i += 1
+
+        plt.plot(x_histo, y_histo)
+        plt.show()
+        Max_red = np.argmax(y_histo)
+        Max_red = Max_red / 10
+
+        return labels, counts, Max_green, Max_red, points_clean
+
+
+
+    def Kmeans_method_2(self,points, k = 2):
+
+        # Initialization: choose k centroids (Forgy, Random Partition, etc.)t
+        c1 = (33)
+        c2 = (47)
+        centroids = (c1,c2)
+
+        # Initialize clusters list
+        clusters = [[] for _ in range(k)]
+
+        # Loop until convergence
+        converged = False
+        while not converged:
+            # Clear previous clusters
+            clusters = [[] for _ in range(k)]
+
+            # Assign each point to the "closest" centroid
+            for point in points:
+                #print(point)
+                distances_to_each_centroid = self.distance(point*10**9, centroids)
+                #print(distances_to_each_centroid)
+                #print("...")
+                cluster_assignment = self.argmin(distances_to_each_centroid)
+                clusters[cluster_assignment].append(point*10**9)
+
+            # Calculate new centroids
+            #   (the standard implementation uses the mean of all points in a
+            #     cluster to determine the new centroid)
+            new_centroids = self.calculate_centroid(clusters)
+
+            converged = (np.round(new_centroids,4) == np.round(centroids,4))
+            print(converged)
+            print(new_centroids,centroids)
+            print("//")
+            centroids = new_centroids
+
+            if converged:
+                print(clusters)
+        
+    def get_histogramm(self, params,type="standard", method = "Covariance"):
+        if type == "standard":
+            #method = params["method"]
             radius_list =[]
             for track in self.tracks:
                 if not track.is_filtered:
@@ -742,7 +1179,7 @@ class AnalyzeTrackCore():
                     elif method == "MSD":
                         radius_list.append(track.r_msd)
 
-            self.y_histo, self.x_histo = np.histogram(radius_list)
+            self.y_histo, self.x_histo = np.histogram(radius_list,bins = 40)#,range=(params["r_min_nm"],params["r_max_nm"]))
             return self.x_histo, self.y_histo
 
         elif type == "gauss":
@@ -751,10 +1188,11 @@ class AnalyzeTrackCore():
             \frac{1}{\sigma \sqrt{2\,\pi}}\, \mathrm{e}^{-\frac{\left(x-\mu\right)^2}{2\sigma^2}}
             where sigma is the standart deviation wheras error_r_cov is the variance
             """
-            nb_pt_in_histo = 2000   #FIXME ? Hardcoded
+              #FIXME ? Hardcoded
             r_min_nm = params["r_min_nm"]
             r_max_nm = params["r_max_nm"]
-            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo)
+            nb_pt_in_histo = 10*r_max_nm
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo)*1E-9
             self.y_histo = np.zeros(nb_pt_in_histo)
             for track in self.tracks:
                 if not track.is_filtered:
@@ -762,20 +1200,75 @@ class AnalyzeTrackCore():
                     #FIXME l'erreur de la covariance est bien trop petite.
                     variance = track.error_r_cov
                     r = track.r_cov
-                    gaussian = 1 / ( np.sqrt(2 * np.pi * variance)) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance))
+                    gaussian = 1 / (variance * np.sqrt(2 * np.pi )) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance **2))
                     gaussian *= 1E9 # to nm
                     self.y_histo += gaussian
+            return self.x_histo, self.y_histo
+
+        elif type == "gauss Red" :
+            r_min_nm = params["r_min_nm"]
+            r_max_nm = params["r_max_nm"]
+            nb_pt_in_histo = 10 * r_max_nm
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+            self.y_histo = np.zeros(nb_pt_in_histo)
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if track.color == 0 :
+                        variance = track.error_r_cov
+                        r = track.r_cov
+                        gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance ** 2))
+                        gaussian *= 1E9  # to nm
+                        self.y_histo += gaussian
+            return self.x_histo, self.y_histo
+        elif type == 'GMM green':
+            r_min_nm = params["r_min_nm"]
+            r_max_nm = params["r_max_nm"]
+            nb_pt_in_histo = 10 * r_max_nm
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+            self.y_histo = np.zeros(nb_pt_in_histo)
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if track.color == 0:
+                        variance = track.error_r_cov
+                        r = track.r_cov
+                        gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(
+                            -(self.x_histo - r) ** 2 / (2 * variance ** 2))
+                        gaussian *= 1E9  # to nm
+                        self.y_histo += gaussian
+            return self.x_histo, self.y_histo
+
+        elif type == "gauss Green" :
+            r_min_nm = params["r_min_nm"]
+            r_max_nm = params["r_max_nm"]
+            nb_pt_in_histo = 10 * r_max_nm
+            self.x_histo = np.linspace(r_min_nm, r_max_nm, nb_pt_in_histo) * 1E-9
+            self.y_histo = np.zeros(nb_pt_in_histo)
+            for track in self.tracks:
+                if not track.is_filtered:
+                    if track.color == 1 :
+                        variance = track.error_r_cov
+                        r = track.r_cov
+                        gaussian = 1 / (variance * np.sqrt(2 * np.pi)) * np.exp(-(self.x_histo - r) ** 2 / (2 * variance ** 2))
+                        gaussian *= 1E9  # to nm
+                        self.y_histo += gaussian
             return self.x_histo, self.y_histo
 
         elif type == "MLE":
             """
             Based on Improved nano-particle tracking analysis John G WalkerMeas. Sci. Technol. 23 (2012) 065605 doi:10.1088/0957-0233/23/6/065605
             """
-            return self.get_histogram_MLE(params)
+            return self.get_histogram_MLE(3,params)
+
+        elif type == "MLE_red":
+            return self.get_histogram_MLE(0,params)
+        elif type == "MLE_green":
+            return self.get_histogram_MLE(1,params)
+        elif type == "MLE_blue":
+            return self.get_histogram_MLE(2,params)
 
 
 
-    def get_histogram_MLE(self, params):
+    def get_histogram_MLE(self, color,params):
         """
         Draw an histogramm of the measured radius of the particle weighting each track with its number of spot.
         More precisely, we use an Minium LogLikelyHood estimation.
@@ -783,7 +1276,7 @@ class AnalyzeTrackCore():
 
         :return:
         """
-        bin_size_nm = 2 # NB : hardcoded
+        bin_size_nm = 5 # NB : hardcoded
         delta_R = bin_size_nm * 1E-9 # SI -> m
 
         # self.T, self.eta, self.timeUnits
@@ -804,16 +1297,26 @@ class AnalyzeTrackCore():
         rs = []
         # conv_fact = 1E-10
         for track in self.tracks:
-            if track.is_filtered:
+            if track.is_filtered or track.r_cov < 0:
                 continue
-            if track.Dx_cov == -1 or track.Dy_cov == -1:
+            if track.D_cov == -1 :
                 continue
-            D = (track.Dx_cov + track.Dy_cov)/2  # * conv_fact -> SI m²/s
-            MSD = D * 4 / self.frame_rate # SI m²
-            MSDs.append(MSD)
-            ks.append(track.nSpots)
-            r = self.radius_nm_from_coeff_diff(D)
-            rs.append(r)
+            if track.color == color :
+                D = track.D_cov   # * conv_fact -> SI m²/s
+
+                MSD = D * 4 / self.frame_rate # SI m²
+                MSDs.append(MSD)
+                ks.append(track.nSpots)
+                r = self.radius_nm_from_coeff_diff(D)
+                rs.append(r)
+            elif color == 3 or color == None :
+                D = track.D_cov  # * conv_fact -> SI m²/s
+                print(D)
+                MSD = D * 4 / self.frame_rate  # SI m²
+                MSDs.append(MSD)
+                ks.append(track.nSpots)
+                r = self.radius_nm_from_coeff_diff(D)
+                rs.append(r)
 
         k_max = max(ks)
         k_min = min(ks)
@@ -826,8 +1329,8 @@ class AnalyzeTrackCore():
 
 
 
-        r_max_nm_user = params["r_max_nm"]
-        r_max_nm_user = 150 #FIXME
+        #r_max_nm_user = params["r_max_nm"]
+        r_max_nm_user = 200 #FIXME
         if r_max_nm_user != 0:
             r_max_nm = r_max_nm_user
 
@@ -905,8 +1408,8 @@ class AnalyzeTrackCore():
             for r_idx in range(bin_num):
                 prob_MSD_LUT[n, r_idx] = probMSD(MSDs[n], ks[n], (r_idx + 1) * delta_R)
 
-        plt.plot(prob_MSD_LUT[10, :])
-        plt.show()
+        #plt.plot(prob_MSD_LUT[20, :])
+        #plt.show()
 
         # Il faut aussi une LUT différente pour lorsque l'on reconstruit l'histogramme des MSD
         prob_hist_MSD_LUT = np.zeros((hist_bin_number, k_max - k_min + 1, bin_num))
@@ -915,9 +1418,10 @@ class AnalyzeTrackCore():
                 for r_idx in range(bin_num):
                     prob_hist_MSD_LUT[b, k-k_min, r_idx] = probMSD((b + 1) * delta_B, k, (r_idx + 1) * delta_R)
 
-
-        plt.plot(prob_hist_MSD_LUT[:, 50, 20])
-        plt.show()
+        #print("pob_hist_MSD_LUT")
+        #plt.plot(prob_hist_MSD_LUT[:, 50, 20])
+        #plt.title("prob_hist_MSD_LUT")
+        #plt.show()
 
         # La densité de probabilité en rayon P_r, ce que l'on cherche est discrétisée en M points indéxé par m, avec r_m = m \Delta r (delta_R ici)
 
@@ -968,7 +1472,9 @@ class AnalyzeTrackCore():
         # initialisation de la densité de proba -> uniforme
         # dens = np.full(hist_bin_number, 1.0 / hist_bin_number)
         dens = np.full(bin_num, 1.0 / bin_num)
+        #print("dens",dens)
         lastChiSquared = getChiSquared(dens)
+        #("LastChiSquared",lastChiSquared)
         changeChiSquared = np.inf
 
         # Ici, il faut que j'utilise les MSD des datas Delta et les nombres de spot k
@@ -1030,6 +1536,7 @@ class AnalyzeTrackCore():
 
         while changeChiSquared > 0.01:
             for m in range(len(dens)):
+                #print("length(dens)",len(dens))
                 sumpm = np.sum(dens)
                 sum_over_n = 0
                 nb_track = len(MSDs)
@@ -1037,18 +1544,30 @@ class AnalyzeTrackCore():
                     denominator = 0
                     # probMSD(msd, k, r)
                     # numerator = probMSD(MSDs[n], ks[n], (m + 1) * delta_R)   # numérateur
-                    numerator = prob_MSD_LUT[n, m]  # numérateur
+                    numerator = prob_MSD_LUT[n, m]
+                    #print("prob_MSD_LUT[n, m]", numerator)
+                    # numérateur
 
                     # dénominateur
                     for l in range(len(dens)):
                         # prob = probMSD(MSDs[n], ks[n], (l + 1) * delta_R)
                         prob = prob_MSD_LUT[n, l]
+                        #print("prob_MSD_LUT[n, l]", prob)
+                        #print("n", n)
+                        #print("l",l)
+                        #print("m",m)
                         denominator += prob * dens[l] / sumpm
+                        #print("denominator", denominator)
+                        if np.isnan(denominator) :
+                            return
                     sum_over_n += numerator / denominator
                 dens[m] *= 1.0 / nb_track * sum_over_n
 
+
             newChiSquared = getChiSquared(dens)
             changeChiSquared = abs(newChiSquared - lastChiSquared) / lastChiSquared
+            if np.isnan(changeChiSquared) :
+                return
             lastChiSquared = newChiSquared
 
 
@@ -1056,9 +1575,15 @@ class AnalyzeTrackCore():
         dens /= np.sum(dens)
         hist_x = np.zeros(len(dens))
         for i in range(len(dens)):
-            hist_x[i] = bin_size_nm * (i + 1) * 2.0  # To Diameter in [nm]
+            hist_x[i] = bin_size_nm * (i + 1)   # To Diameter in [nm]
+        #print("Xisquared",changeChiSquared)
 
+        #print(hist_x,dens)
+        plt.bar(hist_x,dens, width=5, edgecolor='black')
+        plt.show()
         return hist_x, dens
+
+
 
     def get_stats(self):
         # Calculate some statistics
@@ -1117,9 +1642,8 @@ class AnalyzeTrackCore():
             
 
 
-        self.current_task = "Analize momomere"
+        self.current_task = "Analyze momomere"
         self.Analyze_color()
-        self.get_ratio_color()
 
         self.current_task = "Idle"
 
@@ -1135,14 +1659,17 @@ class AnalyzeTrackCore():
         :param track_number:
         :return:
         """
-        track_number = int(float(track_number))
-        if 1 < track_number < np.size(self.tracks,0) :
-            track = self.tracks[track_number - 1]
-            track_x = track.x
-            track_y = track.y
+        if track_number != " ":
+            track_number = int(float(track_number))
+            if 0 < track_number < np.size(self.tracks,0) :
+                track = self.tracks[track_number]
+                track_x = track.x
+                track_y = track.y
 
         else :
-            print("track doesnt exist")
+            #print("track doesnt exist")
+            track_x = []
+            track_y = []
         return track_x,track_y
 
 
@@ -1179,79 +1706,106 @@ class AnalyzeTrackCore():
         tracker_color = []
         if self.tracks != None :
             for track in self.tracks :
-                index = np.where(track.t  == frame_number)[0]
-                if index.size > 0 :
-                    #if track.x[index] != None:
-                    x = track.x[index[0]]
-                    #if track.y[index] != None:
-                    y = track.y[index[0]]
-                    if self.video_array_red[int(y),int(x),frame_number] > self.video_array_green[int(y),int(x),frame_number] :
-                        tracker_red = 1
-                    else :
-                        tracker_red = 0
+                if not track.is_filtered :
+                    index = np.where(track.t  == frame_number)[0]
+                    if index.size > 0 :
+                        #if track.x[index] != None:
+                        x = track.x[index[0]]
+                        #if track.y[index] != None:
+                        y = track.y[index[0]]
+                        if self.video_array_red[int(y),int(x),frame_number]*self.alpha_red > self.video_array_green[int(y),int(x),frame_number] :
+                            tracker_red = 1
+                        else :
+                            tracker_red = 0
 
-                    tracker_color.append(tracker_red)
-                    position.append((x, y))
-            #print(position)
+                        tracker_color.append(tracker_red)
+                        position.append((x, y))
+                #print(position)
 
 
         return position,tracker_color
 
-    def Analyze_color(self, params):
+    def Analyze_color(self):#, params):
         """
         :return:
         """
-
-        self.box_radius = params["Analyze_particle_box_size_in_pixel"]    # ? FIXME Hardcoded
+        self.color_data = []
+        self.box_radius = 4 #params["Analyze_particle_box_size_in_pixel"]    # ? FIXME Hardcoded
         self.red = 0
         self.green = 0
-        self.compteur_red = 0
-        self.compteur_green = 0
 
         for track in self.tracks:
             # For each spot in one track, we calculate the value of the red and green canal around the particle in a size self.
             track.spot_colors = []
             track.spot_main_color = []
+            self.alpha_red = 1
+            track.Value_red = 0
+            track.Value_green = 0
+            track.Value_blue = 0
             for m in range(np.size(track.x)):
                 #FIXME pourquoi -1 sur le compteur temps ?
-                Value_red = np.sum(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
-                Value_green = np.sum(self.video_array_green[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
-                Value_blue = np.sum(
-                    self.video_array_blue[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius,
-                    int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_red += np.sum(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                #print(self.video_array_red[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_green += np.sum(self.video_array_green[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius, int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
+                track.Value_blue += np.sum(self.video_array_blue[int(track.y[m]) - self.box_radius:int(track.y[m]) + self.box_radius,int(track.x[m]) - self.box_radius:int(track.x[m]) + self.box_radius, int(track.t[m]) - 1])
 
-                color = [Value_red, Value_green, Value_blue]
-                track.spot_colors.append(color)
 
-                track.spot_main_color.append(np.argmax(color))   # 0 for red, 1 for green, 2 for blue
+            color = [self.alpha_red*track.Value_red, 1*track.Value_green, track.Value_blue]
+            track.color_tracker = color
+            #track.spot_colors.append(color)
+            track.Value_red = track.Value_red/ ((4*self.box_radius**2)*np.size(track.x))
+            track.Value_green = track.Value_green / ((4*self.box_radius**2)*np.size(track.x))
+            track.Value_blue = track.Value_blue / ((4*self.box_radius**2)*np.size(track.x))
+            #track.spot_main_color.append(np.argmax(color))   # 0 for red, 1 for green, 2 for blue
 
             # Attribute color to the track -> Among all spots, what color was the most present.
             def most_frequent_value(lst):
                 values, counts = np.unique(lst, return_counts=True)
                 most_frequent_index = np.argmax(counts)
                 return values[most_frequent_index]
-            track.color = most_frequent_value(track.spot_main_color)
+            #track.color = most_frequent_value(track.spot_main_color)
+            track.color = color.index(max(color))
 
     def get_ratio_color(self):
-        r, g, b = 0,0,0
+        self.r, self.g, self.b = 0,0,0
+        self.green_radius,self.red_radius,self.blue_radius =[],[],[]
         for track in self.tracks:
             if not track.is_filtered:
                 if track.color == 0:
-                    r += 1
+                    self.r += 1
+
                 elif track.color == 1:
-                    g += 1
+                    self.g += 1
+
                 elif track.color == 2:
-                    b += 1
-        total = r + g + b
-        self.ratio_red = r / total
-        self.ratio_green = g / total
-        self.ratio_blue = b / total
+                    self.b += 1
+
+        total = self.r + self.g + self.b
+        self.ratio_red = self.r*100 / total
+        self.ratio_green = self.g*100 / total
+        self.ratio_blue = self.b*100 / total
 
 
 
     def exportData(self, filename):
         data = (self.Moyenner)
         np.savetxt(filename, data,newline='\n')
+
+    def exported_data_list(self) :
+        # Je filtre les track avec r_cov < 200 et asym < 3 directement dans les fonctions GMM_3D et Kmeans_3D pour l'export de liste donc attention !
+        # j'aime pas coder des filtre en dur mais j'ai pas trop le choix si je veux un export automatique de plusieurs fichiers sans passer par le GUI
+        # (pour ca que j'aime pas les scripts c'est trop rigide et le logiciel a pas ete prevu pour etre rigide c'est meme la raison pour laquelle on a fait un logiciel menfin)
+        data = []
+        labels, label_counts, Max_green, Max_red, points_clean,track_id = self.GMM_3D(2)
+        data.append( np.round(label_counts[0] * 100 / (label_counts[0] + label_counts[1]), 2))
+        data.append( Max_green)
+        data.append( Max_red)
+        labels, label_counts, Max_green, Max_red, points_clean,track_id = self.Kmeans_3D(2)
+        data.append( np.round(label_counts[0] * 100 / (label_counts[0] + label_counts[1]), 2))
+        data.append( Max_green)
+        data.append( Max_red )
+
+        return data
 
 
     def get_all_delta_in_chronological_order(self):
@@ -1351,8 +1905,10 @@ class AnalyzeTrackCore():
         zs = mvt_evolution[:]['z']
         #dof = depth_of_focus_micron
         pos_micrometer_to_pixel = 1 / (self.space_units_nm / 1000)
+
         for i in range(nb_particle):
             track = Track()
+            track.f = list(range(1, nb_spot_per_track + 1))
             track.x = xs[:, i] * pos_micrometer_to_pixel
             track.y = ys[:, i] * pos_micrometer_to_pixel
             track.z = zs[:, i] * pos_micrometer_to_pixel
@@ -1403,6 +1959,7 @@ class AnalyzeTrackCore():
             track.calculate_D_from_gauss(params)
             track.calculate_D_from_MSD(params)
             track.calculate_D_from_covariance(params)
+            track.Tensor_brownian(params)
 
         self.get_stats()
 
@@ -1425,6 +1982,15 @@ class AnalyzeTrackCore():
                 val = track.red_mean
             elif type == "green_mean":
                 val = track.red_mean
+            elif type == "asym" :
+                val = float(track.asym)
+            elif type == "error_percent" :
+                val = float(track.error_percent)
+            elif type == "Absolute red" :
+                val = float(track.Value_red)
+            elif type == "Absolute green" :
+                val = float(track.Value_green)
+
 
             if val is None:
                 return False
@@ -1470,6 +2036,9 @@ class AnalyzeTrackCore():
     def get_correlation_graph(self, data_1_type, data_2_type):
         x_axis = []
         y_axis = []
+        y_axis_error = []
+        track_ID = []
+        color_list = []
         def get_data_from_type(track, type):
             if type == "nSpots":
                 return track.nSpots
@@ -1480,11 +2049,15 @@ class AnalyzeTrackCore():
             elif type == "r_cov":
                 return track.r_cov
             elif type == "red":
-                return track.colors[0]
+                return track.color_tracker[0]*100/(track.color_tracker[0]+track.color_tracker[1]+track.color_tracker[2])
             elif type == "green":
-                return track.colors[1]
+                return (track.color_tracker[1]+track.color_tracker[2])*100/(track.color_tracker[0]+track.color_tracker[1]+track.color_tracker[2])
             elif type == "blue":
-                return track.colors[2]
+                return track.color_tracker[2]*100/(track.color_tracker[0]+track.color_tracker[1]+track.color_tracker[2])
+            elif type == "asym" :
+                return float(track.asym)
+            elif type == "error_percent" :
+                return float(track.error_percent)
 
         if data_1_type == data_2_type:
             data_histo = []
@@ -1495,20 +2068,52 @@ class AnalyzeTrackCore():
 
             # We have to create an histogramm
             hist, bin_edges = np.histogram(data_histo)
-            return hist, bin_edges
+            return hist, bin_edges , track_ID
 
+        i=-1
         for track in self.tracks:
             if track.is_filtered:
+                i= i+1
                 continue
+            i += 1
             x_axis.append(get_data_from_type(track, data_1_type))
+            y_axis_error.append(track.error_r_cov)
+            if track.color == 0:
+                color = "Red"
+            elif track.color == 1:
+                color = "Green"
+            elif track.color == 2:
+                color = "Blue"
+            else :
+                color = "None"
+            row = [
+                i,
+                int(track.f[0]),
+                track.nSpots,
+                np.round(track.r_cov*1e9,2),
+                np.round(track.error_r_cov*1e9,2),
+                color,
+                float(track.asym),
+                float(track.error_percent),
+                track.x,
+                track.y]
+            track_ID.append(row)
             y_axis.append(get_data_from_type(track, data_2_type))
+            color_list.append(color)
 
-        return x_axis, y_axis
+        return x_axis, y_axis,track_ID,color_list,y_axis_error
 
     def clear_filter(self):
         for track in self.tracks:
             track.is_filtered = False
         pass
+    def filtered_click(self,track_info):
+
+        track = self.tracks[track_info]
+        track.is_filtered = True
+
+
+
 
     def get_full_MSD(self):
         msd = []
@@ -1534,8 +2139,8 @@ class AnalyzeTrackCore():
         filename = filePath.name
         nb_bins = int(np.max(self.Moyenner)/5)
         Histoy, Histox = np.histogram(self.Moyenner, bins=nb_bins)
-        print(Histoy)
-        print(Histox)
+        #print(Histoy)
+        #print(Histox)
         Histoy = np.append(Histoy, 0)
         combined_array = np.column_stack((Histox, Histoy))
         with open(filename, 'w') as file:
@@ -1551,8 +2156,8 @@ class AnalyzeTrackCore():
         filtered_data = np.array(self.Moyenner)[self.number_tracks_red]
         nb_bins = int(np.max(filtered_data) / 5)
         Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
-        print(Histoy)
-        print(Histox)
+        #print(Histoy)
+        #print(Histox)
         Histoy = np.append(Histoy, 0)
         combined_array = np.column_stack((Histox, Histoy))
         with open(filename, 'w') as file:
@@ -1568,8 +2173,8 @@ class AnalyzeTrackCore():
         filtered_data = np.array(self.Moyenner)[self.number_tracks_green]
         nb_bins = int(np.max(filtered_data) / 5)
         Histoy, Histox = np.histogram(filtered_data, bins=nb_bins)
-        print(Histoy)
-        print(Histox)
+        #print(Histoy)
+        #print(Histox)
         Histoy = np.append(Histoy, 0)
         combined_array = np.column_stack((Histox, Histoy))
         with open(filename, 'w') as file:
